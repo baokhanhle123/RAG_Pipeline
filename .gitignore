@@ -1,2 +1,14 @@
-.venv
+# Virtual env
+.venv/
+venv/
+
+# Build/py cache (tuỳ chọn)
+__pycache__/
+*.pyc
+
+# JSONL outputs
+*.jsonl
+
+# (không cần liệt kê 2 file dưới nếu đã có *.jsonl, nhưng để rõ ràng vẫn ok)
 pccc_word_elements.jsonl
+pccc_chunks.jsonl
