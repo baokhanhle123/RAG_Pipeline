@@ -6,17 +6,11 @@ Smart chunking cho văn bản luật PCCC đã được partition (từ Unstruct
 và normalize ở bước trước (JSONL các element).
 
 Nguyên tắc:
-- Giữ ranh giới pháp lý: không gộp qua Điều khác nhau; ưu tiên không vượt qua Khoản/Điểm nếu đã nhận diện.
+- Giữ ranh giới pháp lý: không gộp qua Điều khác nhau; ưu tiên không vượt Khoản/Điểm nếu đã nhận diện.
 - Bảng (Table) để nguyên 1 chunk.
 - Chunk theo nhóm element cùng section, sau đó cắt theo câu ~ max_chars; có overlap theo số câu.
 - Tự động tạo 'citation' (van_ban + dieu/khoan/diem + page range nếu có).
 - Kết quả: JSONL sẵn sàng cho indexing/embedding.
-
-Phụ thuộc: chỉ dùng stdlib (không cần tokenizers). Có thể thay max_chars theo embed model.
-
-Khuyến nghị tham số (tham khảo best practices):
-- max_chars: 1000–1600 char/chunk (tùy embed model; BGE-M3 thường ổn ~1200–1500 ký tự).
-- overlap_sents: 1–2 câu để tăng recall. 
 """
 
 from __future__ import annotations
@@ -24,6 +18,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Iterable, Optional, Tuple
 import json, re, hashlib, uuid
 from dataclasses import dataclass, field
+from collections import defaultdict
 
 ###############
 # Cấu trúc dữ liệu
@@ -39,8 +34,6 @@ class Elem:
     @property
     def page(self) -> Optional[int]:
         md = self.metadata or {}
-        # Unstructured thường đặt ở metadata["page_number"] (nếu include_page_breaks)
-        # Tuy .doc/.docx không phải lúc nào cũng có; nếu không, trả None.
         return md.get("page_number")
 
     @property
@@ -72,12 +65,7 @@ class Chunk:
 _SENT_SPLIT = re.compile(r"(?<=[\.?!…])\s+(?=[A-ZÀ-ỴA-ZĐ0-9])|(?<=\.)\s+\n", re.UNICODE)
 
 def split_sentences(text: str) -> List[str]:
-    """
-    Cắt câu đơn giản cho tiếng Việt có xen lẫn kí tự viết hoa/chữ số.
-    Tránh phụ thuộc tokenizer; có thể thay bằng underthesea/pyvi nếu muốn.
-    """
     text = re.sub(r"\s+\n", "\n", text.strip())
-    # Giữ bullet/list xuống dòng là 1 câu riêng
     bullets = re.split(r"\n(?=[\-•●◦▪·]|\d+\)|[a-z]\))", text)
     out = []
     for seg in bullets:
@@ -104,21 +92,13 @@ def build_section_key(md: Dict[str, Any]) -> str:
     return "|".join(keys) if keys else "unknown"
 
 def infer_heading_title(elem: Elem) -> Optional[str]:
-    """Lấy heading gần nhất từ Title/Heading nếu có."""
-    t = elem.metadata.get("category", "") if elem.metadata else ""
-    # Unstructured type/metadata không cố định; fallback vào element type=Title
     if elem.type and elem.type.lower() == "title":
         return elem.text.strip() or None
-    # Một số trường hợp heading nằm ở NarrativeText nhưng match "Điều x" ...
     if re.match(r"^\s*(Chương|Mục|Điều)\b", elem.text, flags=re.IGNORECASE):
         return elem.text.strip()
     return None
 
 def compose_citation(md: Dict[str, Any], page_start: Optional[int], page_end: Optional[int]) -> str:
-    """
-    VD: 'Luật PCCC 2024 — Điều 12, Khoản 3 (trang 14–15)'
-        hoặc 'QCVN 03:2023/BCA — Mục II (trang 27)'
-    """
     vb = md.get("van_ban") or "Văn bản"
     parts = []
     if md.get("dieu"):  parts.append(f"Điều {md['dieu']}")
@@ -149,22 +129,16 @@ def compose_citation(md: Dict[str, Any], page_start: Optional[int], page_end: Op
 ###############
 
 def group_elements_by_section(elems: List[Elem]) -> List[List[Elem]]:
-    """
-    Gom các element theo 'đơn vị pháp lý' để tránh tràn ranh giới.
-    Ưu tiên: dieu -> khoan -> diem. Nếu không có, gộp theo muc/chuong.
-    """
     groups: List[List[Elem]] = []
     cur: List[Elem] = []
     cur_key: Tuple = None
 
     def key_of(e: Elem) -> Tuple:
         md = e.section_keys
-        # Không vượt qua Điều khác nhau
         return (md.get("van_ban"), md.get("dieu") or "", md.get("khoan") or "", md.get("diem") or "",
                 md.get("muc") or "", md.get("chuong") or "")
 
     for e in elems:
-        # Giữ bảng thành nhóm riêng
         if e.type and e.type.lower() == "table":
             if cur:
                 groups.append(cur); cur = []
@@ -198,11 +172,9 @@ def chunk_paragraphs_to_sized_chunks(
     max_chars: int = 1400,
     min_chars: int = 400,
     overlap_sents: int = 2,
+    section_key: str = "unknown",
+    start_index: int = 0,
 ) -> List[Chunk]:
-    """
-    Cắt theo câu để tạo chunk ~max_chars, với overlap theo câu.
-    """
-    # Nối paragraph -> sentences
     all_text = "\n".join([p.strip() for p in paras if p and p.strip()])
     sents = split_sentences(all_text)
     if not sents:
@@ -225,8 +197,8 @@ def chunk_paragraphs_to_sized_chunks(
         p_end   = max([p for p in pages if p is not None], default=None)
         citation = compose_citation(common_md, p_start, p_end)
 
-        section_key = build_section_key(common_md)
-        cid = mk_chunk_id(doc_id, section_key, len(chunks))
+        global_idx = start_index + len(chunks)
+        cid = mk_chunk_id(doc_id, section_key, global_idx)
         meta = {
             **common_md,
             "page_start": p_start,
@@ -241,11 +213,9 @@ def chunk_paragraphs_to_sized_chunks(
             chunk_id=cid,
             text=txt,
             metadata=meta,
-            element_ids=element_ids[:],  # all element ids in the section
+            element_ids=element_ids[:],
         ))
-        # Chuẩn bị overlap
         if overlap_sents > 0:
-            # giữ lại overlap_sents câu cuối làm đệm cho chunk tiếp theo
             tail = buf[-overlap_sents:] if len(buf) > overlap_sents else buf[:]
             buf = tail[:]
         else:
@@ -258,9 +228,7 @@ def chunk_paragraphs_to_sized_chunks(
             flush(i)
         buf.append(s)
 
-    # flush phần còn lại
     flush(len(sents))
-
     return chunks
 
 def smart_chunk_elements(
@@ -269,12 +237,6 @@ def smart_chunk_elements(
     min_chars: int = 400,
     overlap_sents: int = 2,
 ) -> List[Chunk]:
-    """
-    Pipeline:
-      1) Map -> Elem
-      2) Nhóm theo section (không vượt quá Điều/Khoản/Điểm; bảng để riêng)
-      3) Mỗi group -> chunk theo câu ~max_chars
-    """
     elems: List[Elem] = []
     for el in raw_elements:
         elems.append(Elem(
@@ -284,14 +246,14 @@ def smart_chunk_elements(
             metadata=el.get("metadata") or {},
         ))
 
-    # Lấy doc_id/source_sha1 từ level file (đã gắn ở bước preprocess)
+    # đoán doc_id/source_sha1
     doc_id = None
     source_sha1 = None
     for e in elems:
         if e.metadata.get("doc_id"):
             doc_id = e.metadata.get("doc_id")
-        # Bước preprocess đã gắn source_sha1 ở record gốc; cũng có thể nằm ngoài metadata
-    # Fallback từ element fields (nếu preprocess gắn ở root)
+        if e.metadata.get("source_sha1"):
+            source_sha1 = e.metadata.get("source_sha1")
     if not doc_id and raw_elements:
         doc_id = raw_elements[0].get("doc_id", "")
     if not source_sha1 and raw_elements:
@@ -299,18 +261,37 @@ def smart_chunk_elements(
 
     groups = group_elements_by_section(elems)
     out_chunks: List[Chunk] = []
+    sec_counters = defaultdict(int)  # đếm chunk theo section_key
 
     for grp in groups:
-        # Gom paragraphs (trừ Table)
+        # metadata gốc
+        md0 = grp[0].metadata.copy() if grp and grp[0].metadata else {}
+        md0.setdefault("doc_id", doc_id or "")
+        md0.setdefault("source_sha1", source_sha1 or "")
+
+        heading = None
+        for e in grp:
+            h = infer_heading_title(e)
+            if h:
+                heading = h
+                break
+        md0["heading_title"] = heading
+        section_key = build_section_key(md0)
+
+        # Bảng đơn – tạo ngay chunk riêng với chỉ số toàn cục
         if len(grp) == 1 and (grp[0].type or "").lower() == "table":
             e = grp[0]
             md = {**(e.metadata or {})}
-            md.setdefault("doc_id", doc_id)
-            md.setdefault("source_sha1", source_sha1)
+            md.setdefault("doc_id", doc_id or "")
+            md.setdefault("source_sha1", source_sha1 or "")
             md["heading_title"] = infer_heading_title(e)
-            citation = compose_citation(md, e.page, e.page)
-            section_key = build_section_key(md)
-            cid = mk_chunk_id(doc_id or "", section_key, 0)
+            p = e.page
+            citation = compose_citation(md, p, p)
+
+            idx = sec_counters[section_key]
+            cid = mk_chunk_id(doc_id or "", section_key, idx)
+            sec_counters[section_key] += 1
+
             out_chunks.append(Chunk(
                 doc_id=doc_id or "",
                 source_sha1=source_sha1 or "",
@@ -318,8 +299,8 @@ def smart_chunk_elements(
                 text=e.text or "[TABLE]",
                 metadata={
                     **md,
-                    "page_start": e.page,
-                    "page_end": e.page,
+                    "page_start": p,
+                    "page_end": p,
                     "citation": citation,
                     "section_key": section_key,
                     "heading_title": md.get("heading_title"),
@@ -328,22 +309,7 @@ def smart_chunk_elements(
             ))
             continue
 
-        # Common metadata cho group
-        # Ưu tiên lấy section keys từ phần tử đầu
-        md0 = grp[0].metadata.copy() if grp and grp[0].metadata else {}
-        md0.setdefault("doc_id", doc_id or "")
-        md0.setdefault("source_sha1", source_sha1 or "")
-
-        # heading_title: tìm tiêu đề gần nhất trong nhóm
-        heading = None
-        for e in grp:
-            h = infer_heading_title(e)
-            if h:
-                heading = h
-                break
-        md0["heading_title"] = heading
-
-        # Thu paragraphs, ids, pages
+        # Gom paragraphs, ids, pages
         paras, eids, pages = [], [], []
         for e in grp:
             if e.text:
@@ -351,8 +317,8 @@ def smart_chunk_elements(
             eids.append(e.element_id)
             pages.append(e.page)
 
-        # Cắt theo câu -> chunk sized
-        chunks = chunk_paragraphs_to_sized_chunks(
+        start_index = sec_counters[section_key]
+        chs = chunk_paragraphs_to_sized_chunks(
             paras=paras,
             doc_id=doc_id or "",
             common_md=md0,
@@ -361,8 +327,11 @@ def smart_chunk_elements(
             max_chars=max_chars,
             min_chars=min_chars,
             overlap_sents=overlap_sents,
+            section_key=section_key,
+            start_index=start_index,
         )
-        out_chunks.extend(chunks)
+        out_chunks.extend(chs)
+        sec_counters[section_key] += len(chs)
 
     return out_chunks
 
@@ -397,7 +366,6 @@ def run_chunking(in_jsonl: Path, out_jsonl: Path,
                  max_chars: int = 1400, min_chars: int = 400, overlap_sents: int = 2) -> int:
     raw = read_jsonl(in_jsonl)
     chunks = smart_chunk_elements(raw, max_chars=max_chars, min_chars=min_chars, overlap_sents=overlap_sents)
-    # xuất JSONL phẳng
     serial = []
     for c in chunks:
         serial.append({
@@ -413,7 +381,6 @@ def run_chunking(in_jsonl: Path, out_jsonl: Path,
     return n
 
 if __name__ == "__main__":
-    # ví dụ
-    in_jsonl  = Path("./pccc_word_elements.jsonl")  # file tạo ở bước preprocess
+    in_jsonl  = Path("./pccc_word_elements.jsonl")
     out_jsonl = Path("./pccc_chunks.jsonl")
     run_chunking(in_jsonl, out_jsonl, max_chars=1400, min_chars=400, overlap_sents=2)

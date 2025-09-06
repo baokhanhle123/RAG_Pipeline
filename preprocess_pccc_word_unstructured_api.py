@@ -12,8 +12,11 @@ Yêu cầu:
   pip install requests python-dateutil
 Biến môi trường:
   UNSTRUCTURED_API_KEY: API key
-  UNSTRUCTURED_API_URL: mặc định dùng free endpoint https://api.unstructured.io/general/v0/general
+    : mặc định dùng free endpoint https://api.unstructured.io/general/v0/general
 Tham khảo API & tham số: docs.unstructured.io (partition endpoint, api parameters)
+
+export UNSTRUCTURED_API_URL="https://api.unstructuredapp.io/general/v0/general"
+export UNSTRUCTURED_API_KEY=""
 """
 
 from __future__ import annotations
@@ -280,9 +283,9 @@ if __name__ == "__main__":
     # (Các file mẫu user đã upload ở /mnt/data)
     sample_paths = [
         Path("dataset/Luật PCCC 2024 55_2024_QH15_621347.doc"),
-        Path("dataset/Nghị định 105-2025-NĐ-CP ngày 15-05-2025 hướng dẫn Luật Phòng cháy, chữa cháy và cứu nạn, cứu hộ.doc"),
-        Path("dataset/QCVN 03 2023 BCA về Phương tiện phòng cháy và chữa cháy_VN.doc"),
-        Path("dataset/B.1. Bảng đối chiếu quy hoạch.docx"),
+        # Path("dataset/Nghị định 105-2025-NĐ-CP ngày 15-05-2025 hướng dẫn Luật Phòng cháy, chữa cháy và cứu nạn, cứu hộ.doc"),
+        # Path("dataset/QCVN 03 2023 BCA về Phương tiện phòng cháy và chữa cháy_VN.doc"),
+        # Path("dataset/B.1. Bảng đối chiếu quy hoạch.docx"),
     ]
     out = Path("./pccc_word_elements.jsonl")
     preprocess_word_folder(sample_paths, out)
