@@ -1,4 +1,5 @@
 chroma_pccc_text_embedding_3_small
+.env
 
 # Virtual env
 .venv/

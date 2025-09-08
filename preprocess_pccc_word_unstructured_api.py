@@ -2,290 +2,386 @@
 # -*- coding: utf-8 -*-
 
 """
-Tiền xử lý Word (.doc/.docx) văn bản luật PCCC bằng Unstructured API.
-- Gửi file qua multipart/form-data
-- Nhận list element (Title/NarrativeText/ListItem/Table/... + metadata)
-- Gắn thêm metadata pháp lý (chuong/muc/dieu/khoan/diem/phu_luc) để phục vụ trích dẫn
-- Xuất JSONL (1 dòng / element) cho pipeline RAG
+Tiền xử lý Word (DOC/DOCX) bằng Unstructured API.
+- Tự động thêm file mới trong thư mục vào pccc_word_elements.jsonl
+- Phát hiện trùng file theo nội dung (SHA-1), in log và bỏ qua nếu đã có
 
 Yêu cầu:
   pip install requests python-dateutil
-Biến môi trường:
-  UNSTRUCTURED_API_KEY: API key
-    : mặc định dùng free endpoint https://api.unstructured.io/general/v0/general
-Tham khảo API & tham số: docs.unstructured.io (partition endpoint, api parameters)
 
-export UNSTRUCTURED_API_URL="https://api.unstructuredapp.io/general/v0/general"
-export UNSTRUCTURED_API_KEY=""
+Biến môi trường:
+  UNSTRUCTURED_API_URL  (mặc định: https://api.unstructuredapp.io/general/v0/general)
+  UNSTRUCTURED_API_KEY  (bắt buộc)
+
+Tham khảo Unstructured Partition Endpoint:
+- URL & header 'unstructured-api-key'  ➜ docs Overview & Quickstart
+- Tham số 'files' (bắt buộc), 'include_page_breaks', 'languages', 'encoding' ➜ API parameters
 """
 
 from __future__ import annotations
-import os, re, json, time, uuid, hashlib, mimetypes
+
+import argparse
+import hashlib
+import json
+import mimetypes
+import os
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any, Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
+
 import requests
+from requests.adapters import HTTPAdapter, Retry
 
-# =========================
-# Cấu hình & tiện ích chung
-# =========================
 
-API_URL = os.getenv("UNSTRUCTURED_API_URL", "").strip()
-API_KEY = os.getenv("UNSTRUCTURED_API_KEY", "").strip()
+# ============== Cấu hình mặc định ==============
 
-# MIME cho Word
-MIME_BY_EXT = {
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".doc":  "application/msword",
-}
+DEFAULT_API_URL = os.getenv("UNSTRUCTURED_API_URL", "https://api.unstructuredapp.io/general/v0/general").strip()
+API_KEY_ENV = "UNSTRUCTURED_API_KEY"
 
-HEADERS = {
-    "accept": "application/json",
-    # CHUẨN ĐÚNG: Không dùng Authorization Bearer
-    "unstructured-api-key": API_KEY if API_KEY else "",
-}
+# Unstructured chấp nhận form-data:
+#  - files=<file>
+#  - include_page_breaks=true/false
+#  - languages=["vie"] (chuỗi JSON)
+#  - encoding="utf-8"
+# Tham chiếu: Partition Endpoint overview & parameters
+# https://docs.unstructured.io/api-reference/partition/overview
+# https://docs.unstructured.io/api-reference/partition/api-parameters
 
-def sha1_of_file(p: Path, chunk: int = 1 << 20) -> str:
-    h = hashlib.sha1()
-    with p.open("rb") as f:
-        for b in iter(lambda: f.read(chunk), b""):
-            h.update(b)
-    return h.hexdigest()
+ALLOWED_EXTS = {".doc", ".docx"}
 
-def guess_mime(path: Path) -> str:
-    return MIME_BY_EXT.get(path.suffix.lower(), mimetypes.guess_type(str(path))[0] or "application/octet-stream")
+# ============== Kiểu dữ liệu tiện ích ==============
 
-# ================
-# Gọi Unstructured
-# ================
+@dataclass
+class ApiConfig:
+    url: str
+    api_key: str
+    include_page_breaks: bool = True
+    encoding: str = "utf-8"
+    languages: List[str] = None  # ví dụ ["vie"]
 
-def partition_word_via_unstructured_api(
-    file_path: Path,
-    languages: List[str] = ["vie", "eng"],
-    include_page_breaks: bool = True,
-    coordinates: bool = True,
-    encoding: str = "utf-8",
-    timeout: int = 120,
-    max_retries: int = 3,
-    backoff_sec: float = 2.0,
-) -> List[Dict[str, Any]]:
-    assert API_KEY, (
-        "Thiếu UNSTRUCTURED_API_KEY. Hãy `export UNSTRUCTURED_API_KEY=...` "
-        "và đảm bảo header 'unstructured-api-key' được set."
-    )
-    assert API_URL.startswith("http"), (
-        "Thiếu/không hợp lệ UNSTRUCTURED_API_URL. Ví dụ Free: "
-        "https://api.unstructured.io/general/v0/general; "
-        "Starter/Team: URL hiển thị trong tài khoản."
-    )
-    assert file_path.exists(), f"Không thấy file: {file_path}"
-
-    data = {
-        "languages": json.dumps(languages),          # multipart: truyền list dưới dạng JSON string
-        "include_page_breaks": str(include_page_breaks).lower(),
-        "coordinates": str(coordinates).lower(),
-        "encoding": encoding,
-        "output_format": "application/json",
-    }
-
-    last_err = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            mime = guess_mime(file_path)
-            # QUAN TRỌNG: Mở lại file mỗi lần retry để không bị EOF
-            with file_path.open("rb") as f:
-                files = {"files": (file_path.name, f, mime)}
-                resp = requests.post(API_URL, headers=HEADERS, data=data, files=files, timeout=timeout)
-
-            if resp.status_code == 200:
-                out = resp.json()
-                if isinstance(out, dict) and "elements" in out:
-                    return out["elements"] or []
-                if isinstance(out, list):
-                    return out
-                return out if isinstance(out, list) else []
-
-            # Gợi ý chẩn đoán thông minh cho 401/403
-            if resp.status_code in (401, 403):
-                msg = resp.text
-                hint = []
-                if "API key is missing" in msg or "missing" in msg.lower():
-                    hint.append("Header phải là 'unstructured-api-key', không phải 'Authorization'.")
-                hint.append("Kiểm tra cặp URL–Key: Free dùng api.unstructured.io; Starter/Team dùng URL .app.io (xem account).")
-                raise RuntimeError(f"Auth lỗi {resp.status_code}: {msg[:300]} | Gợi ý: " + " ".join(hint))
-
-            if resp.status_code in (429, 500, 502, 503, 504):
-                last_err = RuntimeError(f"{resp.status_code} {resp.text[:300]}")
-                time.sleep(backoff_sec * attempt)
-                continue
-
-            raise RuntimeError(f"API lỗi {resp.status_code}: {resp.text[:1000]}")
-
-        except requests.RequestException as e:
-            last_err = e
-            time.sleep(backoff_sec * attempt)
-            continue
-
-    raise last_err or RuntimeError("Partition failed without explicit error.")
-
-# ===========================
-# Chuẩn hoá & trích xuất luật
-# ===========================
-
-_re_chuong  = re.compile(r"^\s*Chương\s+([IVXLCDM]+)\b", re.IGNORECASE)
-_re_muc     = re.compile(r"^\s*Mục\s+([IVXLCDM]+)\b", re.IGNORECASE)
-_re_dieu    = re.compile(r"^\s*Điều\s+(\d+[A-Za-z]*)\b", re.IGNORECASE)
-_re_khoan   = re.compile(r"^\s*Khoản\s+(\d+)\b", re.IGNORECASE)
-_re_diem    = re.compile(r"^\s*([a-zA-Z])\)", re.IGNORECASE)  # "a) b) c)"
-_re_phuluc  = re.compile(r"^\s*Phụ\s*lục\s*([A-Z0-9\-]+)?\b", re.IGNORECASE)
-
-# Nhận diện loại văn bản & số hiệu (cơ bản, có thể mở rộng)
-_re_loai_vb = re.compile(
-    r"\b(?:Luật|Nghị\s*định|Thông\s*tư|QCVN|TCVN)\b[^\n]*", re.IGNORECASE
-)
-
-def enrich_hierarchy(elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Duyệt tuần tự element để gắn trạng thái Chương/Mục/Điều/Khoản/Điểm/Phụ lục.
-    Đồng thời suy đoán 'van_ban' (tên văn bản/số hiệu) từ các Title/Heading/NarrativeText đầu tài liệu.
-    """
-    chuong = muc = dieu = khoan = diem = phu_luc = None
-    van_ban: Optional[str] = None
-
-    # Thử suy đoán văn bản ở 50 element đầu
-    head_text = []
-    for el in elements[:50]:
-        t = (el.get("text") or "").strip()
-        if t:
-            head_text.append(t)
-    joined = "\n".join(head_text)
-    m = _re_loai_vb.search(joined)
-    if m:
-        van_ban = m.group(0).strip()
-
-    out: List[Dict[str, Any]] = []
-    for el in elements:
-        text = (el.get("text") or "").strip()
-        if not text:
-            # vẫn giữ lại (ví dụ PageBreak) để bảo toàn số trang
-            pass
-
-        # cập nhật mức tiêu đề nếu khớp
-        if _re_chuong.match(text):
-            chuong, muc, dieu, khoan, diem = _re_chuong.match(text).group(1), None, None, None, None
-        elif _re_muc.match(text):
-            muc, dieu, khoan, diem = _re_muc.match(text).group(1), None, None, None
-        elif _re_dieu.match(text):
-            dieu, khoan, diem = _re_dieu.match(text).group(1), None, None
-        elif _re_khoan.match(text):
-            khoan, diem = _re_khoan.match(text).group(1), None
-        elif _re_diem.match(text):
-            diem = _re_diem.match(text).group(1)
-        elif _re_phuluc.match(text):
-            phu_luc = _re_phuluc.match(text).group(1) or ""
-
-        meta = el.get("metadata") or {}
-        # gắn hierarchy vào metadata mới
-        meta_enriched = {
-            **meta,
-            "chuong": chuong,
-            "muc": muc,
-            "dieu": dieu,
-            "khoan": khoan,
-            "diem": diem,
-            "phu_luc": phu_luc,
-            "van_ban": van_ban,
+    def to_form(self) -> Dict[str, str]:
+        data = {
+            "include_page_breaks": "true" if self.include_page_breaks else "false",
+            "encoding": self.encoding,
         }
+        if self.languages:
+            data["languages"] = json.dumps(self.languages, ensure_ascii=False)
+        return data
 
-        # tạo bản ghi chuẩn hoá
-        normalized = {
-            "doc_id": meta.get("filename") or "",
-            "source_sha1": meta.get("sha256") or "",  # API đôi khi cung cấp sha256; nếu không có sẽ gán ở ngoài
-            "element_id": el.get("id") or str(uuid.uuid4()),
-            "type": el.get("type"),
-            "text": text,
-            "metadata": meta_enriched,
-        }
-        out.append(normalized)
-    return out
 
-def attach_file_level_metadata(
-    normalized: List[Dict[str, Any]],
-    file_path: Path,
-    source_sha1: str,
-) -> List[Dict[str, Any]]:
-    for row in normalized:
-        row["doc_id"] = file_path.name
-        if not row.get("source_sha1"):
-            row["source_sha1"] = source_sha1
-        # đảm bảo có page_number nếu API đã chèn PageBreak
-        # Unstructured sẽ tạo element type="PageBreak" với metadata.page_number tăng dần nếu bật include_page_breaks
-        # (khả dụng cho một số định dạng; với .docx có thể không luôn có trang)
-    return normalized
+# ============== Tiện ích I/O JSONL ==============
 
-def write_jsonl(records: Iterable[Dict[str, Any]], out_path: Path) -> int:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+def append_jsonl(path: Path, rows: Iterable[dict]) -> int:
+    """Append các dòng JSON vào file JSONL (tạo nếu chưa có)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     n = 0
-    with out_path.open("w", encoding="utf-8") as f:
-        for rec in records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    with path.open("a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
             n += 1
     return n
 
-# =====================
-# Pipeline xử lý thư mục
-# =====================
+
+def iter_jsonl(path: Path) -> Iterable[dict]:
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                # bỏ dòng hỏng (log cảnh báo nhẹ)
+                sys.stderr.write(f"[WARN] Bỏ qua dòng JSONL lỗi tại {path}\n")
+                continue
+
+
+# ============== Tính hash & lọc trùng ==============
+
+def sha1_file(path: Path, bufsize: int = 1 << 20) -> str:
+    h = hashlib.sha1()
+    with path.open("rb") as f:
+        while True:
+            b = f.read(bufsize)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def scan_word_files(in_dir: Path) -> List[Path]:
+    files = []
+    for p in sorted(in_dir.rglob("*")):
+        if p.is_file() and p.suffix.lower() in ALLOWED_EXTS:
+            files.append(p)
+    return files
+
+
+def get_mime_for_word(path: Path) -> str:
+    # .docx: application/vnd.openxmlformats-officedocument.wordprocessingml.document
+    # .doc : application/msword
+    if path.suffix.lower() == ".docx":
+        return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    if path.suffix.lower() == ".doc":
+        return "application/msword"
+    # fallback
+    mt, _ = mimetypes.guess_type(str(path))
+    return mt or "application/octet-stream"
+
+
+def collect_existing_hashes(out_jsonl: Path) -> Dict[str, int]:
+    """Lấy set SHA-1 đã có trong JSONL (tính theo 'source_sha1')."""
+    seen = {}
+    if not out_jsonl.exists():
+        return seen
+    for i, row in enumerate(iter_jsonl(out_jsonl), 1):
+        src_sha1 = (row.get("source_sha1") or
+                    (row.get("metadata") or {}).get("source_sha1"))
+        if src_sha1:
+            seen[src_sha1] = seen.get(src_sha1, 0) + 1
+    return seen
+
+
+def find_duplicates_in_batch(paths: List[Path]) -> Dict[str, List[Path]]:
+    """Nhóm các file trong thư mục có SHA-1 trùng nhau."""
+    groups: Dict[str, List[Path]] = {}
+    for p in paths:
+        try:
+            h = sha1_file(p)
+        except Exception as e:
+            sys.stderr.write(f"[WARN] Không tính được SHA-1: {p} ({e})\n")
+            continue
+        groups.setdefault(h, []).append(p)
+    return {h: lst for h, lst in groups.items() if len(lst) > 1}
+
+
+# ============== Unstructured API ==============
+
+def make_session() -> requests.Session:
+    sess = requests.Session()
+    retries = Retry(
+        total=5,
+        backoff_factor=1.2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    return sess
+
+
+def partition_via_unstructured_api(
+    path: Path,
+    cfg: ApiConfig,
+    timeout: int = 120,
+) -> List[dict]:
+    """
+    Gọi Partition Endpoint cho 1 file.
+    - Header: 'unstructured-api-key' (theo Quickstart/Overview)
+    - Form data chính: files, languages, encoding, include_page_breaks
+    Trả về: list element (JSON)
+    """
+    assert cfg.api_key, "Thiếu UNSTRUCTURED_API_KEY"
+
+    mime = get_mime_for_word(path)
+    files = {
+        "files": (path.name, path.open("rb"), mime),
+    }
+    data = cfg.to_form()
+
+    headers = {
+        "accept": "application/json",
+        "unstructured-api-key": cfg.api_key,  # theo tài liệu Quickstart
+    }
+
+    sess = make_session()
+    resp = sess.post(cfg.url, headers=headers, files=files, data=data, timeout=timeout)
+
+    if resp.status_code != 200:
+        # In lỗi chi tiết để dễ debug (401: thiếu key; 4xx khác: tham số/định dạng)
+        snippet = resp.text[:1000]
+        raise RuntimeError(f"Unstructured API lỗi {resp.status_code}: {snippet}")
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"Phản hồi API không phải JSON: {e}")
+
+    if not isinstance(data, list):
+        raise RuntimeError("Phản hồi API không phải danh sách element.")
+
+    return data
+
+
+# ============== Chuẩn hoá kết quả để ghi JSONL ==============
+
+def elements_to_jsonl_rows(
+    elements: List[dict],
+    src_path: Path,
+    src_sha1: str,
+    doc_id: Optional[str] = None,
+    extra_meta: Optional[Dict] = None,
+) -> List[dict]:
+    """
+    Mỗi element sẽ ghi 1 dòng JSONL, giữ nguyên 'element' gốc + metadata bổ sung.
+    """
+    ts = datetime.utcnow().isoformat() + "Z"
+    doc_id = doc_id or src_path.stem
+    rows = []
+    for el in elements:
+        # el: {"type": "...", "text": "...", "metadata": {...}, "id": "...", ...}
+        text = (el.get("text") or "").strip()
+        etype = el.get("type") or ""
+        meta = el.get("metadata") or {}
+        row = {
+            "source_path": str(src_path),
+            "source_name": src_path.name,
+            "source_sha1": src_sha1,
+            "doc_id": doc_id,
+            "element_id": el.get("id"),
+            "element_type": etype,
+            "text": text,
+            "metadata": meta,
+            "element": el,  # giữ nguyên element gốc để downstream có thể dùng thêm
+            "ingested_at": ts,
+        }
+        if extra_meta:
+            row["metadata_extra"] = extra_meta
+        rows.append(row)
+    return rows
+
+
+# ============== Pipeline chính ==============
 
 def preprocess_word_folder(
-    inputs: List[Path],
+    in_dir: Path,
     out_jsonl: Path,
-    languages: List[str] = ["vie","eng"],
-) -> int:
+    api_url: str,
+    api_key: str,
+    languages: Optional[List[str]] = None,
+    include_page_breaks: bool = True,
+    encoding: str = "utf-8",
+) -> Tuple[int, int, int]:
     """
-    Xử lý danh sách file .doc/.docx → out_jsonl (append).
+    Quét thư mục, phát hiện file Word mới, gọi API, và append vào JSONL.
+    Trả về: (n_files_tổng, n_files_mới, n_elements_ghi)
     """
-    total = 0
-    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    assert in_dir.exists(), f"Không thấy thư mục: {in_dir}"
+    cfg = ApiConfig(
+        url=api_url.strip() or DEFAULT_API_URL,
+        api_key=api_key.strip(),
+        include_page_breaks=include_page_breaks,
+        encoding=encoding,
+        languages=languages or ["vie"],
+    )
 
-    for p in inputs:
-        if not p.exists():
-            print(f"⚠️  Bỏ qua (không tồn tại): {p}")
-            continue
-        if p.suffix.lower() not in (".doc", ".docx"):
-            print(f"⚠️  Bỏ qua (không phải Word): {p.name}")
+    files = scan_word_files(in_dir)
+    if not files:
+        print(f"[INFO] Không có file .doc/.docx trong {in_dir}")
+        return (0, 0, 0)
+
+    # 1) Phát hiện trùng trong batch (cùng thư mục)
+    dups = find_duplicates_in_batch(files)
+    if dups:
+        print("[WARN] Phát hiện file trùng nhau (cùng nội dung) trong thư mục:")
+        for h, lst in dups.items():
+            for i, p in enumerate(lst, 1):
+                print(f"    - [{i}] {p}")
+            print(f"      SHA1={h}\n")
+
+    # 2) Đã xử lý trước đó? (đọc JSONL để lấy SHA-1 đã có)
+    existing = collect_existing_hashes(out_jsonl)
+    if existing:
+        print(f"[INFO] Đã có {len(existing)} SHA-1 trong {out_jsonl} (sẽ bỏ qua nếu trùng).")
+
+    n_total, n_new_files, n_elements_written = 0, 0, 0
+
+    for path in files:
+        n_total += 1
+        try:
+            h = sha1_file(path)
+        except Exception as e:
+            print(f"[WARN] Bỏ qua (không tính được SHA-1): {path} ({e})")
             continue
 
-        print(f"🔹 Partition: {p.name}")
-        elements = partition_word_via_unstructured_api(
-            p,
-            languages=languages,
-            include_page_breaks=True,
-            coordinates=True,
-            encoding="utf-8",
+        if h in existing:
+            print(f"[SKIP] Trùng file đã xử lý (SHA1={h[:12]}...) — {path}")
+            continue
+
+        print(f"[PROCESS] {path} (SHA1={h[:12]}...)")
+        try:
+            els = partition_via_unstructured_api(path, cfg)
+        except Exception as e:
+            print(f"[ERROR] API lỗi cho {path}: {e}")
+            continue
+
+        rows = elements_to_jsonl_rows(
+            elements=els,
+            src_path=path,
+            src_sha1=h,
+            doc_id=path.stem,  # bạn có thể thay logic xác định doc_id theo convention nội bộ
+            extra_meta={
+                "api_url": cfg.url,
+                "include_page_breaks": cfg.include_page_breaks,
+                "encoding": cfg.encoding,
+                "languages": cfg.languages,
+            },
         )
-        source_sha1 = sha1_of_file(p)
-        normalized = enrich_hierarchy(elements)
-        normalized = attach_file_level_metadata(normalized, p, source_sha1)
+        n_written = append_jsonl(out_jsonl, rows)
+        n_elements_written += n_written
+        n_new_files += 1
+        # cập nhật bộ nhớ 'existing' để nếu batch có file khác cùng SHA-1 sẽ skip tiếp
+        existing[h] = existing.get(h, 0) + len(rows)
 
-        with out_jsonl.open("a", encoding="utf-8") as f:
-            for rec in normalized:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                total += 1
+    print(f"[DONE] Files: total={n_total}, new={n_new_files} → wrote {n_elements_written} elements to {out_jsonl}")
+    return (n_total, n_new_files, n_elements_written)
 
-    print(f"✅ Đã ghi {total} element → {out_jsonl}")
-    return total
 
-# ============
-# Ví dụ chạy thử
-# ============
+# ============== CLI ==============
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Preprocess PCCC Word files via Unstructured API.")
+    p.add_argument("--in_dir", type=str, required=True, help="Thư mục chứa các file .doc/.docx")
+    p.add_argument("--out_jsonl", type=str, default="./pccc_word_elements.jsonl", help="Đường dẫn file JSONL đầu ra (append)")
+    p.add_argument("--api_url", type=str, default=DEFAULT_API_URL, help="Partition Endpoint URL (mặc định theo ENV hoặc default)")
+    p.add_argument("--languages", type=str, default="vie", help="Danh sách ngôn ngữ, ví dụ: 'vie' hoặc 'vie,eng'")
+    p.add_argument("--no_page_breaks", action="store_true", help="Tắt include_page_breaks (mặc định bật)")
+    p.add_argument("--encoding", type=str, default="utf-8", help="Encoding văn bản (mặc định utf-8)")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    api_key = os.getenv(API_KEY_ENV, "").strip()
+    if not api_key:
+        print(f"[FATAL] Thiếu biến môi trường {API_KEY_ENV}.")
+        print("  Xem tài liệu Unstructured Partition Endpoint để lấy API key & URL mặc định.")
+        # default URL & header: https://docs.unstructured.io/api-reference/partition/overview
+        sys.exit(1)
+
+    in_dir = Path(args.in_dir)
+    out_jsonl = Path(args.out_jsonl)
+    api_url = args.api_url.strip() or DEFAULT_API_URL
+    languages = [x.strip() for x in (args.languages or "").split(",") if x.strip()]
+
+    preprocess_word_folder(
+        in_dir=in_dir,
+        out_jsonl=out_jsonl,
+        api_url=api_url,
+        api_key=api_key,
+        languages=languages or ["vie"],
+        include_page_breaks=not args.no_page_breaks,
+        encoding=args.encoding,
+    )
+
 
 if __name__ == "__main__":
-    # Thay đổi đường dẫn theo môi trường của bạn
-    # (Các file mẫu user đã upload ở /mnt/data)
-    sample_paths = [
-        Path("dataset/Luật PCCC 2024 55_2024_QH15_621347.doc"),
-        Path("dataset/Nghị định 105-2025-NĐ-CP ngày 15-05-2025 hướng dẫn Luật Phòng cháy, chữa cháy và cứu nạn, cứu hộ.doc"),
-        Path("dataset/QCVN 03 2023 BCA về Phương tiện phòng cháy và chữa cháy_VN.doc"),
-        Path("dataset/B.1. Bảng đối chiếu quy hoạch.docx"),
-    ]
-    out = Path("./pccc_word_elements.jsonl")
-    preprocess_word_folder(sample_paths, out)
+    main()

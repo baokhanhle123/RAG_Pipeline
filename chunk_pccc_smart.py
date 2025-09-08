@@ -2,385 +2,601 @@
 # -*- coding: utf-8 -*-
 
 """
-Smart chunking cho văn bản luật PCCC đã được partition (từ Unstructured API)
-và normalize ở bước trước (JSONL các element).
+Chunking 'smart' (incremental) cho PCCC — bản nâng cấp:
+- Hợp nhất nhiều Title liên tiếp thành 1 tiêu đề section.
+- Phát hiện Khoản/Điểm dạng liệt kê: "1.", "1)", "(1)", "a.", "a)", "(a)", và "Khoản x", "Điểm y".
+- Chèn tiêu đề Điều/Khoản/Điểm vào ĐẦU MỖI CHUNK để tăng recall.
+- Incremental: chỉ xử lý các (source_sha1, doc_id) mới, log trùng file.
 
-Nguyên tắc:
-- Giữ ranh giới pháp lý: không gộp qua Điều khác nhau; ưu tiên không vượt Khoản/Điểm nếu đã nhận diện.
-- Bảng (Table) để nguyên 1 chunk.
-- Chunk theo nhóm element cùng section, sau đó cắt theo câu ~ max_chars; có overlap theo số câu.
-- Tự động tạo 'citation' (van_ban + dieu/khoan/diem + page range nếu có).
-- Kết quả: JSONL sẵn sàng cho indexing/embedding.
+Tài liệu tham chiếu:
+- Cấu trúc Chương–Mục–Điều–Khoản–Điểm trong VBQPPL VN.  (see: Law on promulgation …) 
+- Element types của Unstructured: Title, NarrativeText, ListItem, ... (Partitioning docs)
+- Đếm token bằng tiktoken; chunk theo token & overlap (OpenAI Cookbook; RAG chunking best practices)
+
+CLI:
+  python chunk_pccc_smart_incremental.py \
+      --in_jsonl ./pccc_word_elements.jsonl \
+      --out_jsonl ./pccc_chunks.jsonl \
+      --chunk_tokens 520 \
+      --overlap_tokens 80 \
+      --no_article_header   # (tùy chọn) tắt chèn tiêu đề Điều vào đầu chunk
 """
 
 from __future__ import annotations
 from pathlib import Path
-from typing import List, Dict, Any, Iterable, Optional, Tuple
-import json, re, hashlib, uuid
-from dataclasses import dataclass, field
-from collections import defaultdict
+from typing import Dict, Iterable, List, Optional, Tuple, Any
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass
 
-###############
-# Cấu trúc dữ liệu
-###############
+# =========================
+# I/O JSONL helpers
+# =========================
 
-@dataclass
-class Elem:
-    element_id: str
-    type: str
-    text: str
-    metadata: Dict[str, Any]
-
-    @property
-    def page(self) -> Optional[int]:
-        md = self.metadata or {}
-        return md.get("page_number")
-
-    @property
-    def section_keys(self) -> Dict[str, Optional[str]]:
-        md = self.metadata or {}
-        return {
-            "van_ban": md.get("van_ban"),
-            "chuong": md.get("chuong"),
-            "muc": md.get("muc"),
-            "dieu": md.get("dieu"),
-            "khoan": md.get("khoan"),
-            "diem": md.get("diem"),
-            "phu_luc": md.get("phu_luc"),
-        }
-
-@dataclass
-class Chunk:
-    doc_id: str
-    source_sha1: str
-    chunk_id: str
-    text: str
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    element_ids: List[str] = field(default_factory=list)
-
-###############
-# Tiện ích
-###############
-
-_SENT_SPLIT = re.compile(r"(?<=[\.?!…])\s+(?=[A-ZÀ-ỴA-ZĐ0-9])|(?<=\.)\s+\n", re.UNICODE)
-
-def split_sentences(text: str) -> List[str]:
-    text = re.sub(r"\s+\n", "\n", text.strip())
-    bullets = re.split(r"\n(?=[\-•●◦▪·]|\d+\)|[a-z]\))", text)
-    out = []
-    for seg in bullets:
-        seg = seg.strip()
-        if not seg:
-            continue
-        parts = re.split(_SENT_SPLIT, seg)
-        for p in parts:
-            p = p.strip()
-            if p:
-                out.append(p)
-    return out
-
-def mk_chunk_id(doc_id: str, section_key: str, idx: int) -> str:
-    base = f"{doc_id}::{section_key}::{idx}"
-    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
-
-def build_section_key(md: Dict[str, Any]) -> str:
-    keys = []
-    for k in ("van_ban","chuong","muc","dieu","khoan","diem","phu_luc"):
-        v = md.get(k)
-        if v:
-            keys.append(f"{k}:{v}")
-    return "|".join(keys) if keys else "unknown"
-
-def infer_heading_title(elem: Elem) -> Optional[str]:
-    if elem.type and elem.type.lower() == "title":
-        return elem.text.strip() or None
-    if re.match(r"^\s*(Chương|Mục|Điều)\b", elem.text, flags=re.IGNORECASE):
-        return elem.text.strip()
-    return None
-
-def compose_citation(md: Dict[str, Any], page_start: Optional[int], page_end: Optional[int]) -> str:
-    vb = md.get("van_ban") or "Văn bản"
-    parts = []
-    if md.get("dieu"):  parts.append(f"Điều {md['dieu']}")
-    if md.get("khoan"): parts.append(f"Khoản {md['khoan']}")
-    if md.get("diem"):  parts.append(f"Điểm {md['diem']}")
-    if not parts and md.get("muc"):
-        parts.append(f"Mục {md['muc']}")
-    if not parts and md.get("chuong"):
-        parts.append(f"Chương {md['chuong']}")
-    sec = ", ".join(parts) if parts else None
-
-    pages = None
-    if page_start and page_end and page_start != page_end:
-        pages = f"trang {page_start}–{page_end}"
-    elif page_start:
-        pages = f"trang {page_start}"
-
-    if sec and pages:
-        return f"{vb} — {sec} ({pages})"
-    if sec:
-        return f"{vb} — {sec}"
-    if pages:
-        return f"{vb} ({pages})"
-    return vb
-
-###############
-# Lõi chunking
-###############
-
-def group_elements_by_section(elems: List[Elem]) -> List[List[Elem]]:
-    groups: List[List[Elem]] = []
-    cur: List[Elem] = []
-    cur_key: Tuple = None
-
-    def key_of(e: Elem) -> Tuple:
-        md = e.section_keys
-        return (md.get("van_ban"), md.get("dieu") or "", md.get("khoan") or "", md.get("diem") or "",
-                md.get("muc") or "", md.get("chuong") or "")
-
-    for e in elems:
-        if e.type and e.type.lower() == "table":
-            if cur:
-                groups.append(cur); cur = []
-            groups.append([e])
-            cur_key = None
-            continue
-
-        k = key_of(e)
-        if cur_key is None:
-            cur_key = k
-            cur = [e]
-            continue
-
-        if k != cur_key:
-            groups.append(cur)
-            cur = [e]
-            cur_key = k
-        else:
-            cur.append(e)
-
-    if cur:
-        groups.append(cur)
-    return groups
-
-def chunk_paragraphs_to_sized_chunks(
-    paras: List[str],
-    doc_id: str,
-    common_md: Dict[str, Any],
-    element_ids: List[str],
-    pages: List[Optional[int]],
-    max_chars: int = 1400,
-    min_chars: int = 400,
-    overlap_sents: int = 2,
-    section_key: str = "unknown",
-    start_index: int = 0,
-) -> List[Chunk]:
-    all_text = "\n".join([p.strip() for p in paras if p and p.strip()])
-    sents = split_sentences(all_text)
-    if not sents:
-        sents = [all_text] if all_text else []
-
-    chunks: List[Chunk] = []
-    buf: List[str] = []
-    start_idx = 0
-
-    def flush(idx: int):
-        nonlocal buf, start_idx
-        if not buf:
-            return
-        txt = " ".join(buf).strip()
-        if not txt:
-            buf = []
-            start_idx = idx
-            return
-        p_start = min([p for p in pages if p is not None], default=None)
-        p_end   = max([p for p in pages if p is not None], default=None)
-        citation = compose_citation(common_md, p_start, p_end)
-
-        global_idx = start_index + len(chunks)
-        cid = mk_chunk_id(doc_id, section_key, global_idx)
-        meta = {
-            **common_md,
-            "page_start": p_start,
-            "page_end": p_end,
-            "citation": citation,
-            "section_key": section_key,
-            "heading_title": common_md.get("heading_title"),
-        }
-        chunks.append(Chunk(
-            doc_id=doc_id,
-            source_sha1=common_md.get("source_sha1",""),
-            chunk_id=cid,
-            text=txt,
-            metadata=meta,
-            element_ids=element_ids[:],
-        ))
-        if overlap_sents > 0:
-            tail = buf[-overlap_sents:] if len(buf) > overlap_sents else buf[:]
-            buf = tail[:]
-        else:
-            buf = []
-        start_idx = idx
-
-    for i, s in enumerate(sents):
-        cur_len = sum(len(x) + 1 for x in buf)
-        if cur_len + len(s) > max_chars and cur_len >= min_chars:
-            flush(i)
-        buf.append(s)
-
-    flush(len(sents))
-    return chunks
-
-def smart_chunk_elements(
-    raw_elements: List[Dict[str, Any]],
-    max_chars: int = 1400,
-    min_chars: int = 400,
-    overlap_sents: int = 2,
-) -> List[Chunk]:
-    elems: List[Elem] = []
-    for el in raw_elements:
-        elems.append(Elem(
-            element_id=el.get("element_id") or el.get("id") or str(uuid.uuid4()),
-            type=el.get("type") or "",
-            text=(el.get("text") or "").strip(),
-            metadata=el.get("metadata") or {},
-        ))
-
-    # đoán doc_id/source_sha1
-    doc_id = None
-    source_sha1 = None
-    for e in elems:
-        if e.metadata.get("doc_id"):
-            doc_id = e.metadata.get("doc_id")
-        if e.metadata.get("source_sha1"):
-            source_sha1 = e.metadata.get("source_sha1")
-    if not doc_id and raw_elements:
-        doc_id = raw_elements[0].get("doc_id", "")
-    if not source_sha1 and raw_elements:
-        source_sha1 = raw_elements[0].get("source_sha1", "")
-
-    groups = group_elements_by_section(elems)
-    out_chunks: List[Chunk] = []
-    sec_counters = defaultdict(int)  # đếm chunk theo section_key
-
-    for grp in groups:
-        # metadata gốc
-        md0 = grp[0].metadata.copy() if grp and grp[0].metadata else {}
-        md0.setdefault("doc_id", doc_id or "")
-        md0.setdefault("source_sha1", source_sha1 or "")
-
-        heading = None
-        for e in grp:
-            h = infer_heading_title(e)
-            if h:
-                heading = h
-                break
-        md0["heading_title"] = heading
-        section_key = build_section_key(md0)
-
-        # Bảng đơn – tạo ngay chunk riêng với chỉ số toàn cục
-        if len(grp) == 1 and (grp[0].type or "").lower() == "table":
-            e = grp[0]
-            md = {**(e.metadata or {})}
-            md.setdefault("doc_id", doc_id or "")
-            md.setdefault("source_sha1", source_sha1 or "")
-            md["heading_title"] = infer_heading_title(e)
-            p = e.page
-            citation = compose_citation(md, p, p)
-
-            idx = sec_counters[section_key]
-            cid = mk_chunk_id(doc_id or "", section_key, idx)
-            sec_counters[section_key] += 1
-
-            out_chunks.append(Chunk(
-                doc_id=doc_id or "",
-                source_sha1=source_sha1 or "",
-                chunk_id=cid,
-                text=e.text or "[TABLE]",
-                metadata={
-                    **md,
-                    "page_start": p,
-                    "page_end": p,
-                    "citation": citation,
-                    "section_key": section_key,
-                    "heading_title": md.get("heading_title"),
-                },
-                element_ids=[e.element_id],
-            ))
-            continue
-
-        # Gom paragraphs, ids, pages
-        paras, eids, pages = [], [], []
-        for e in grp:
-            if e.text:
-                paras.append(e.text)
-            eids.append(e.element_id)
-            pages.append(e.page)
-
-        start_index = sec_counters[section_key]
-        chs = chunk_paragraphs_to_sized_chunks(
-            paras=paras,
-            doc_id=doc_id or "",
-            common_md=md0,
-            element_ids=eids,
-            pages=pages,
-            max_chars=max_chars,
-            min_chars=min_chars,
-            overlap_sents=overlap_sents,
-            section_key=section_key,
-            start_index=start_index,
-        )
-        out_chunks.extend(chs)
-        sec_counters[section_key] += len(chs)
-
-    return out_chunks
-
-###############
-# I/O helpers
-###############
-
-def read_jsonl(path: Path) -> List[Dict[str, Any]]:
-    out = []
+def read_jsonl_iter(path: Path) -> Iterable[dict]:
+    if not path.exists():
+        return
     with path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for ln, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
-            out.append(json.loads(line))
-    return out
+            try:
+                yield json.loads(line)
+            except Exception:
+                sys.stderr.write(f"[WARN] Bỏ dòng hỏng ở {path}:{ln}\n")
 
-def write_jsonl(records: Iterable[Dict[str, Any]], path: Path) -> int:
+def append_jsonl(path: Path, rows: Iterable[dict]) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     n = 0
-    with path.open("w", encoding="utf-8") as f:
-        for r in records:
+    with path.open("a", encoding="utf-8") as f:
+        for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
             n += 1
     return n
 
-###############
-# CLI nhỏ
-###############
+# =========================
+# Thu thập SHA-1 đã xử lý
+# =========================
 
-def run_chunking(in_jsonl: Path, out_jsonl: Path,
-                 max_chars: int = 1400, min_chars: int = 400, overlap_sents: int = 2) -> int:
-    raw = read_jsonl(in_jsonl)
-    chunks = smart_chunk_elements(raw, max_chars=max_chars, min_chars=min_chars, overlap_sents=overlap_sents)
-    serial = []
-    for c in chunks:
-        serial.append({
-            "doc_id": c.doc_id,
-            "source_sha1": c.source_sha1,
-            "chunk_id": c.chunk_id,
-            "text": c.text,
-            "metadata": c.metadata,
-            "element_ids": c.element_ids,
-        })
-    n = write_jsonl(serial, out_jsonl)
-    print(f"✅ Đã tạo {n} chunks → {out_jsonl}")
-    return n
+def collect_processed_sha1(out_jsonl: Path) -> Dict[str, int]:
+    """Tập SHA-1 đã có trong file chunks (để skip)."""
+    seen: Dict[str, int] = {}
+    if not out_jsonl.exists():
+        return seen
+    for row in read_jsonl_iter(out_jsonl):
+        sha1 = row.get("source_sha1") or (row.get("metadata") or {}).get("source_sha1")
+        if sha1:
+            seen[sha1] = seen.get(sha1, 0) + 1
+    return seen
+
+# =========================
+# Gom element theo nguồn
+# =========================
+
+@dataclass
+class RawElement:
+    element_id: Optional[str]
+    element_type: str
+    text: str
+    metadata: Dict[str, Any]
+    source_name: str
+    source_path: str
+    page_number: Optional[int]
+
+def _extract_element_fields(row: dict) -> RawElement:
+    el = row.get("element") or {}
+    element_id = row.get("element_id") or el.get("id")
+    etype = row.get("element_type") or el.get("type") or ""
+    text = row.get("text") or el.get("text") or ""
+    metadata = row.get("metadata") or el.get("metadata") or {}
+    src_name = row.get("source_name") or Path(row.get("source_path","")).name
+    src_path = row.get("source_path") or ""
+    page = metadata.get("page_number")
+    try:
+        page = int(page) if page is not None else None
+    except Exception:
+        page = None
+    return RawElement(
+        element_id=element_id,
+        element_type=str(etype),
+        text=str(text or ""),
+        metadata=metadata or {},
+        source_name=str(src_name or ""),
+        source_path=str(src_path or ""),
+        page_number=page,
+    )
+
+def group_elements_by_source(in_jsonl: Path) -> Tuple[Dict[Tuple[str,str], List[RawElement]], Dict[str, List[str]]]:
+    """
+    Trả về:
+      - groups[(source_sha1, doc_id)] = [RawElement, ...]
+      - dup_paths[source_sha1] = [source_path1, source_path2, ...] nếu có nhiều path cho cùng sha1
+    """
+    groups: Dict[Tuple[str,str], List[RawElement]] = {}
+    sha1_to_paths: Dict[str, List[str]] = {}
+
+    for row in read_jsonl_iter(in_jsonl):
+        sha1 = row.get("source_sha1")
+        if not sha1:
+            continue
+        doc_id = row.get("doc_id") or (Path(row.get("source_path","")).stem or sha1)
+        relem = _extract_element_fields(row)
+
+        key = (sha1, doc_id)
+        groups.setdefault(key, []).append(relem)
+
+        p = relem.source_path or row.get("source_path") or ""
+        if p:
+            lst = sha1_to_paths.setdefault(sha1, [])
+            if p not in lst:
+                lst.append(p)
+
+    dup_paths = {h: lst for h, lst in sha1_to_paths.items() if len(lst) > 1}
+    return groups, dup_paths
+
+# =========================
+# Tiktoken để hạn mức token
+# =========================
+
+try:
+    import tiktoken  # OpenAI tokenizer
+    ENC = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    ENC = None
+
+def tok_len(s: str) -> int:
+    if ENC is None:
+        return max(1, len(s)//2)
+    return len(ENC.encode(s or ""))
+
+def truncate_tokens(s: str, max_tokens: int) -> str:
+    if tok_len(s) <= max_tokens:
+        return s
+    if ENC is None:
+        return s[: max_tokens * 2]
+    ids = ENC.encode(s)
+    return ENC.decode(ids[:max_tokens])
+
+# =========================
+# Heuristic tách câu (TV)
+# =========================
+
+_SENT_SPLIT = re.compile(r"(?<=[\.!?…])\s+|\n+(?=[^\s])")
+
+def split_sentences_vi(text: str) -> List[str]:
+    sents = [s.strip() for s in _SENT_SPLIT.split(text.strip()) if s.strip()]
+    return sents
+
+# =========================
+# Nhận diện heading pháp lý (mở rộng)
+# =========================
+
+# Các pattern chính thức
+HDR_PATTERNS = {
+    "chuong": re.compile(r"^\s*Chương\s+([IVXLCDM]+|\d+)\b", re.IGNORECASE),
+    "muc":    re.compile(r"^\s*Mục\s+([A-Z0-9]+)\b", re.IGNORECASE),
+    "dieu":   re.compile(r"^\s*Điều\s+(\d+)\b", re.IGNORECASE),
+    "khoan":  re.compile(r"^\s*Khoản\s+(\d+)\b", re.IGNORECASE),
+    "diem":   re.compile(r"^\s*Điểm\s+([a-z])\b", re.IGNORECASE),
+    "phuluc": re.compile(r"^\s*Phụ\s*lục\s+([A-Z0-9]+)\b", re.IGNORECASE),
+}
+
+# Mẫu liệt kê thường gặp cho Khoản/Điểm: 1., 1), (1), a., a), (a)
+ENUM_KHOAN = [
+    re.compile(r"^\s*(\d+)[\.\)]\s+"),
+    re.compile(r"^\s*\((\d+)\)\s+"),
+]
+ENUM_DIEM = [
+    re.compile(r"^\s*([a-z])[\.\)]\s+"),
+    re.compile(r"^\s*\(([a-z])\)\s+"),
+]
+
+def detect_heading_info(text: str) -> Dict[str, Optional[str]]:
+    info = {"chuong":None, "muc":None, "dieu":None, "khoan":None, "diem":None, "phu_luc":None}
+    t = (text or "").strip()
+    if not t:
+        return info
+    for k, pat in HDR_PATTERNS.items():
+        m = pat.search(t)
+        if m:
+            val = m.group(1)
+            if k == "phuluc": k = "phu_luc"
+            info[k] = val
+
+    # Bổ sung: nhận dạng liệt kê ở đầu dòng
+    if info["khoan"] is None:
+        for p in ENUM_KHOAN:
+            m = p.match(t)
+            if m:
+                info["khoan"] = m.group(1)
+                break
+    if info["diem"] is None:
+        for p in ENUM_DIEM:
+            m = p.match(t)
+            if m:
+                info["diem"] = m.group(1)
+                break
+    return info
+
+def update_state_with(info: Dict[str, Optional[str]], state: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
+    """Cập nhật state theo mức độ; khi thay Điều → reset Khoản/Điểm; khi thay Khoản → reset Điểm."""
+    st = dict(state)
+    changed = False
+    if info.get("chuong"):
+        st["chuong"] = info["chuong"]; changed = True
+    if info.get("muc"):
+        st["muc"] = info["muc"]; changed = True
+    if info.get("phu_luc"):
+        st["phu_luc"] = info["phu_luc"]; changed = True
+    if info.get("dieu"):
+        st["dieu"] = info["dieu"]; st["khoan"] = None; st["diem"] = None; changed = True
+    if info.get("khoan"):
+        st["khoan"] = info["khoan"]; st["diem"] = None; changed = True
+    if info.get("diem"):
+        st["diem"] = info["diem"]; changed = True
+    st["_changed"] = changed
+    return st
+
+def make_section_key(state: Dict[str, Optional[str]], fallback_title: str="") -> str:
+    parts = []
+    if state.get("chuong"): parts.append(f"CHUONG_{state['chuong']}")
+    if state.get("muc"):    parts.append(f"MUC_{state['muc']}")
+    if state.get("dieu"):   parts.append(f"DIEU_{state['dieu']}")
+    if state.get("khoan"):  parts.append(f"KHOAN_{state['khoan']}")
+    if state.get("diem"):   parts.append(f"DIEM_{state['diem']}")
+    if state.get("phu_luc"):parts.append(f"PHULUC_{state['phu_luc']}")
+    if not parts and fallback_title:
+        ft = re.sub(r"\s+", "_", fallback_title.strip())[:60]
+        parts.append(ft)
+    return ".".join(parts) or "SECTION"
+
+def build_citation(van_ban: str, state: Dict[str, Optional[str]], page_start: Optional[int], page_end: Optional[int]) -> str:
+    segs = []
+    if state.get("chuong"): segs.append(f"Chương {state['chuong']}")
+    if state.get("muc"):    segs.append(f"Mục {state['muc']}")
+    if state.get("dieu"):   segs.append(f"Điều {state['dieu']}")
+    if state.get("khoan"):  segs.append(f"Khoản {state['khoan']}")
+    if state.get("diem"):   segs.append(f"Điểm {state['diem']}")
+    if state.get("phu_luc"):segs.append(f"Phụ lục {state['phu_luc']}")
+    right = ", ".join(segs) if segs else ""
+    cite = f"{van_ban}"
+    if right: cite += f" — {right}"
+    if page_start is not None or page_end is not None:
+        a = page_start if page_start is not None else page_end
+        b = page_end if page_end is not None else page_start
+        if a is not None and b is not None:
+            cite += f" | trang {a}–{b}" if a != b else f" | trang {a}"
+    return cite
+
+def build_article_header_line(state: Dict[str, Optional[str]], title: str) -> str:
+    """Chuẩn hoá header 'Điều x — Khoản y, Điểm z: <title>' để tăng recall."""
+    bits = []
+    if state.get("dieu"): bits.append(f"Điều {state['dieu']}")
+    if state.get("khoan"): bits.append(f"Khoản {state['khoan']}")
+    if state.get("diem"): bits.append(f"Điểm {state['diem']}")
+    head = " — ".join([bits[0], ", ".join(bits[1:])]) if len(bits) > 1 else (bits[0] if bits else "")
+    if head and title:
+        return f"{head}: {title}"
+    if head:
+        return head
+    return title or ""
+
+# =========================
+# Chunking theo token
+# =========================
+
+def chunk_sentences(sentences: List[str], max_tokens: int, overlap_tokens: int) -> List[str]:
+    chunks = []
+    cur: List[str] = []
+    cur_tok = 0
+
+    def flush():
+        nonlocal cur, cur_tok
+        if cur:
+            chunks.append(" ".join(cur).strip())
+            cur = []
+            cur_tok = 0
+
+    for s in sentences:
+        t = tok_len(s)
+        if t > max_tokens:
+            # cắt cứng câu quá dài
+            txt = s
+            while tok_len(txt) > max_tokens:
+                if ENC:
+                    ids = ENC.encode(txt)
+                    seg = ENC.decode(ids[:max_tokens])
+                    rest = ENC.decode(ids[max_tokens:])
+                else:
+                    seg = txt[:max_tokens*2]
+                    rest = txt[max_tokens*2:]
+                if seg.strip():
+                    if cur_tok + tok_len(seg) > max_tokens: flush()
+                    cur.append(seg); cur_tok += tok_len(seg); flush()
+                txt = rest
+            if txt.strip():
+                if cur_tok + tok_len(txt) > max_tokens: flush()
+                cur.append(txt); cur_tok += tok_len(txt); flush()
+            continue
+
+        if cur_tok + t <= max_tokens:
+            cur.append(s); cur_tok += t
+        else:
+            # tạo overlap theo token từ chunk trước
+            flush()
+            if chunks and overlap_tokens > 0:
+                prev = chunks[-1]
+                if tok_len(prev) > overlap_tokens:
+                    if ENC:
+                        ids = ENC.encode(prev)
+                        overlap_txt = ENC.decode(ids[-overlap_tokens:])
+                    else:
+                        overlap_txt = prev[-overlap_tokens*2:]
+                    cur = [overlap_txt]
+                    cur_tok = tok_len(overlap_txt)
+            if cur_tok + t > max_tokens:
+                flush()
+            cur.append(s); cur_tok += t
+
+    flush()
+    return [c for c in chunks if c]
+
+# =========================
+# Gom element → section → chunk (với hợp nhất Title)
+# =========================
+
+@dataclass
+class SectionBuf:
+    title: str
+    state: Dict[str, Optional[str]]
+    texts: List[str]
+    elem_ids: List[str]
+    pages: List[int]
+
+def smart_chunk_one_doc(
+    elems: List[RawElement],
+    doc_id: str,
+    source_sha1: str,
+    chunk_tokens: int = 520,
+    overlap_tokens: int = 80,
+    prepend_article_header: bool = True,
+    flush_on_khoan: bool = True,
+    flush_on_diem: bool = True,
+) -> List[dict]:
+    """
+    elems: các element của 1 tài liệu, nên theo thứ tự tự nhiên từ Unstructured.
+    - Hợp nhất Title liên tiếp: gom vào title_buffer cho tới khi gặp nội dung kế tiếp.
+    - Phát hiện heading/enum: nếu gặp Điều/Khoản/Điểm mới → flush section (tuỳ tham số).
+    - Chèn header 'Điều x — Khoản y, Điểm z: <title>' vào đầu chunk (tuỳ chọn).
+    """
+    current = SectionBuf(
+        title="",
+        state={"chuong":None,"muc":None,"dieu":None,"khoan":None,"diem":None,"phu_luc":None},
+        texts=[], elem_ids=[], pages=[]
+    )
+    sections: List[SectionBuf] = []
+    title_buffer: List[str] = []  # hợp nhất nhiều Title liên tiếp
+
+    def flush_section():
+        nonlocal current
+        # nếu chưa gán title mà buffer có nội dung → set title
+        if not current.title and title_buffer:
+            current.title = " — ".join([t.strip() for t in title_buffer if t.strip()])
+        if current.texts:
+            sections.append(current)
+        # reset
+        current = SectionBuf(
+            title="", 
+            state={"chuong":None,"muc":None,"dieu":None,"khoan":None,"diem":None,"phu_luc":None},
+            texts=[], elem_ids=[], pages=[]
+        )
+
+    def ensure_title_from_buffer():
+        if not current.title and title_buffer:
+            current.title = " — ".join([t.strip() for t in title_buffer if t.strip()])
+
+    for el in elems:
+        t = (el.text or "").strip()
+        if not t:
+            continue
+        etype = (el.element_type or "").lower()
+
+        if etype == "title":
+            # tích lũy title, đồng thời cập nhật state nếu phát hiện heading
+            title_buffer.append(t)
+            info = detect_heading_info(t)
+            # Nếu title chứa Điều/Khoản/Điểm mới → flush section cũ trước (nếu có nội dung)
+            next_state = update_state_with(info, current.state)
+            if next_state["_changed"]:
+                if current.texts:
+                    flush_section()
+                current.state = {k:v for k,v in next_state.items() if k != "_changed"}
+            # chưa flush: chờ tới khi có nội dung thực
+            # (không thêm title vào texts để tránh lặp)
+            continue
+
+        # Non-title: trước hết chốt title từ buffer nếu có
+        ensure_title_from_buffer()
+
+        # Nhận diện heading inline ở đầu đoạn (Điều/Khoản/Điểm dạng liệt kê)
+        info_inline = detect_heading_info(t)
+        if any(info_inline.values()):
+            # nếu Điều thay đổi → luôn flush
+            if info_inline.get("dieu"):
+                if current.texts:
+                    flush_section()
+                current.state = {k:v for k,v in update_state_with(info_inline, current.state).items() if k != "_changed"}
+            else:
+                # Khoản/Điểm: tuỳ chọn flush để chia nhỏ hơn
+                changed_state = update_state_with(info_inline, current.state)
+                if changed_state["_changed"]:
+                    if (info_inline.get("khoan") and flush_on_khoan and current.texts) or \
+                       (info_inline.get("diem")  and flush_on_diem  and current.texts):
+                        flush_section()
+                    current.state = {k:v for k,v in changed_state.items() if k != "_changed"}
+
+        # Ghi nội dung vào section hiện tại
+        current.texts.append(t)
+        if el.element_id: current.elem_ids.append(el.element_id)
+        if el.page_number is not None: current.pages.append(el.page_number)
+
+    # flush cuối
+    if current.texts or title_buffer:
+        flush_section()
+
+    # 2) Section → Chunk
+    chunks: List[dict] = []
+    van_ban = doc_id  # fallback nếu không có tên văn bản chuẩn
+    for sec in sections:
+        body = "\n".join(sec.texts).strip()
+        if not body:
+            continue
+
+        # Xây header textual để tăng recall
+        pre_header = ""
+        if prepend_article_header:
+            pre_header = build_article_header_line(sec.state, sec.title).strip()
+        header = ""
+        if pre_header:
+            header = pre_header + "\n"
+
+        text_full = (header + body).strip()
+        sents = split_sentences_vi(text_full)
+        parts = chunk_sentences(sents, max_tokens=chunk_tokens, overlap_tokens=overlap_tokens)
+
+        page_start = min(sec.pages) if sec.pages else None
+        page_end   = max(sec.pages) if sec.pages else None
+
+        section_key = make_section_key(sec.state, fallback_title=sec.title)
+        citation = build_citation(van_ban, sec.state, page_start, page_end)
+
+        for j, part in enumerate(parts):
+            base = f"{source_sha1}|{section_key}|{j}"
+            cid = hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
+            chunk = {
+                "chunk_id": cid,
+                "text": part,
+                "doc_id": doc_id,
+                "source_sha1": source_sha1,
+                "metadata": {
+                    "section_key": section_key,
+                    "van_ban": van_ban,
+                    "chuong": sec.state.get("chuong"),
+                    "muc": sec.state.get("muc"),
+                    "dieu": sec.state.get("dieu"),
+                    "khoan": sec.state.get("khoan"),
+                    "diem": sec.state.get("diem"),
+                    "phu_luc": sec.state.get("phu_luc"),
+                    "page_start": page_start,
+                    "page_end": page_end,
+                    "citation": citation,
+                    "element_ids": sec.elem_ids,
+                    "source_name": "",  # có thể gán từ elems[0] nếu muốn
+                    "source_path": "",
+                }
+            }
+            chunks.append(chunk)
+
+    return chunks
+
+# =========================
+# Pipeline incremental
+# =========================
+
+def run_incremental_chunking(
+    in_jsonl: Path,
+    out_jsonl: Path,
+    chunk_tokens: int = 520,
+    overlap_tokens: int = 80,
+    prepend_article_header: bool = True,
+    flush_on_khoan: bool = True,
+    flush_on_diem: bool = True,
+) -> Tuple[int, int, int]:
+    """
+    Trả về: (n_docs_tổng, n_docs_mới, n_chunks_ghi)
+    - n_docs_* theo (source_sha1, doc_id)
+    """
+    groups, dup_paths = group_elements_by_source(in_jsonl)
+
+    if dup_paths:
+        print("[WARN] Phát hiện file trùng (cùng nội dung, khác path) trong input:")
+        for h, lst in dup_paths.items():
+            print(f"  SHA1={h}")
+            for p in lst:
+                print(f"    - {p}")
+
+    processed = collect_processed_sha1(out_jsonl)
+    if processed:
+        print(f"[INFO] Đã thấy {len(processed)} nguồn (SHA-1) trong {out_jsonl} — sẽ bỏ qua nếu trùng.")
+
+    n_total_docs = len(groups)
+    n_new_docs = 0
+    n_chunks = 0
+
+    for (sha1, doc_id), elems in groups.items():
+        if sha1 in processed:
+            print(f"[SKIP] Đã chunk trước đó: {doc_id} (SHA1={sha1[:12]}...)")
+            continue
+
+        print(f"[PROCESS] {doc_id} (SHA1={sha1[:12]}...) — elements={len(elems)}")
+        chunks = smart_chunk_one_doc(
+            elems=elems,
+            doc_id=doc_id,
+            source_sha1=sha1,
+            chunk_tokens=chunk_tokens,
+            overlap_tokens=overlap_tokens,
+            prepend_article_header=prepend_article_header,
+            flush_on_khoan=flush_on_khoan,
+            flush_on_diem=flush_on_diem,
+        )
+        if not chunks:
+            print(f"[WARN] Không tạo được chunk: {doc_id} (SHA1={sha1[:12]}...)")
+            continue
+
+        wrote = append_jsonl(out_jsonl, chunks)
+        n_chunks += wrote
+        n_new_docs += 1
+
+        processed[sha1] = processed.get(sha1, 0) + wrote
+
+    print(f"[DONE] docs total={n_total_docs}, new={n_new_docs} → wrote {n_chunks} chunks → {out_jsonl}")
+    return n_total_docs, n_new_docs, n_chunks
+
+# =========================
+# CLI
+# =========================
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Chunking 'smart' incremental cho PCCC (nâng cấp)")
+    p.add_argument("--in_jsonl", type=str, required=True, help="Đường dẫn pccc_word_elements.jsonl")
+    p.add_argument("--out_jsonl", type=str, default="./pccc_chunks.jsonl", help="File JSONL đầu ra (append)")
+    p.add_argument("--chunk_tokens", type=int, default=520, help="Số token tối đa mỗi chunk")
+    p.add_argument("--overlap_tokens", type=int, default=80, help="Số token overlap giữa các chunk liên tiếp")
+    p.add_argument("--no_article_header", action="store_true", help="Không chèn tiêu đề Điều/Khoản/Điểm vào đầu chunk")
+    p.add_argument("--no_flush_khoan", action="store_true", help="Không tách section khi gặp Khoản mới")
+    p.add_argument("--no_flush_diem", action="store_true", help="Không tách section khi gặp Điểm mới")
+    return p.parse_args()
+
+def main():
+    args = parse_args()
+    in_jsonl = Path(args.in_jsonl)
+    out_jsonl = Path(args.out_jsonl)
+    assert in_jsonl.exists(), f"Không thấy file: {in_jsonl}"
+
+    run_incremental_chunking(
+        in_jsonl=in_jsonl,
+        out_jsonl=out_jsonl,
+        chunk_tokens=args.chunk_tokens,
+        overlap_tokens=args.overlap_tokens,
+        prepend_article_header=not args.no_article_header,
+        flush_on_khoan=not args.no_flush_khoan,
+        flush_on_diem=not args.no_flush_diem,
+    )
 
 if __name__ == "__main__":
-    in_jsonl  = Path("./pccc_word_elements.jsonl")
-    out_jsonl = Path("./pccc_chunks.jsonl")
-    run_chunking(in_jsonl, out_jsonl, max_chars=1400, min_chars=400, overlap_sents=2)
+    main()

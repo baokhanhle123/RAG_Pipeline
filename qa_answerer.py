@@ -297,7 +297,8 @@ def _print_sources(sources: List[Dict[str, Any]]):
         print(f"[{i}] {cite}")
 
 if __name__ == "__main__":
-    q = "Yêu cầu về phòng cháy, chữa cháy khi lập, điều chỉnh dự án đầu tư xây dựng công trình, thiết kế công trình, cải tạo, thay đổi công năng sử dụng công trình, sản xuất, lắp ráp, đóng mới, hoán cải phương tiện giao thông" if len(sys.argv) == 1 else " ".join(sys.argv[1:])
+    # q = "Yêu cầu về phòng cháy, chữa cháy khi lập, điều chỉnh dự án đầu tư xây dựng công trình, thiết kế công trình, cải tạo, thay đổi công năng sử dụng công trình, sản xuất, lắp ráp, đóng mới, hoán cải phương tiện giao thông" if len(sys.argv) == 1 else " ".join(sys.argv[1:])
+    q = f"Trong các gara ô-tô dạng kín. Đưa ra Bảng Quy định về bố trí khoang đệm ngăn cháy trong gara ô-tô dạng kín"
     ans, ctx = answer(q)
     print("\n--- ANSWER ---\n", ans)
     _print_sources(ctx)
