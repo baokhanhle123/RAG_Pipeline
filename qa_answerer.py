@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-QA Answerer cho PCCC (VN) — retrieve → (lọc/ưu tiên modality) → rerank (cross-encoder + priors) → generate
-- Nếu câu hỏi về BẢNG: in nguyên văn bảng Markdown trước, rồi mới giải thích & trích dẫn.
-- Ưu tiên văn bản mới (recency) nếu metadata có ngày hiệu lực/ban hành; giảm trùng.
+QA Answerer PCCC (VN) — retrieve → (lọc/ưu tiên modality) → rerank → generate
+- Nếu câu hỏi về BẢNG: in nguyên văn bảng Markdown trước, rồi giải thích & trích dẫn.
+- Ưu tiên văn bản mới (recency) nếu metadata có ngày; giảm trùng.
+- Agent chuẩn hoá prompt & chống lệch chủ đề (prompt_guard).
 
 ENV:
   OPENAI_API_KEY
@@ -16,7 +17,7 @@ ENV:
 
   TOPK_RETRIEVE=20
   PREFER_MODALITY=auto       # auto|table|image|text|none
-  ONLY_MODALITY=0            # 1 = lọc chặt theo modality (sử dụng where_document với tag [BẢNG]/[HÌNH])
+  ONLY_MODALITY=0            # 1 = lọc chặt theo modality bằng where_document [BẢNG]/[HÌNH]
   STRICT_TABLE_RETRIEVE=0    # 1 = nếu query là 'table' thì ép only_modality=True
 
   # Rerank
@@ -33,6 +34,10 @@ ENV:
   TABLE_RENDER_MAX_ROWS=30
   TABLE_RENDER_MAX_TABLES=2
   TABLE_RENDER_MAX_CHARS=12000
+
+  # Prompt guard
+  PROMPT_GUARD=1
+  PROMPT_GUARD_USE_LLM=0
 """
 
 from __future__ import annotations
@@ -42,8 +47,9 @@ import os, re, json, argparse
 
 import chromadb
 from openai import OpenAI
+from prompt_guard import guard_prompt
 
-# ====== Embedding tokenizer (để cắt an toàn) ======
+# ---------- Embedding tokenizer ----------
 try:
     import tiktoken
     ENC = tiktoken.get_encoding("cl100k_base")
@@ -60,7 +66,7 @@ def truncate_tokens(s: str, max_tokens: int) -> str:
     ids = ENC.encode(s or "")
     return ENC.decode(ids[:max_tokens])
 
-# ====== OpenAI ======
+# ---------- OpenAI ----------
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL  = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 
@@ -73,7 +79,7 @@ def embed_query(client: OpenAI, q: str) -> List[float]:
     q = truncate_tokens(q, int(os.getenv("MAX_EMBED_TOKENS", "8000")))
     return client.embeddings.create(model=EMBED_MODEL, input=[q]).data[0].embedding
 
-# ====== Chroma ======
+# ---------- Chroma ----------
 PERSIST_DIR   = Path(os.getenv("CHROMA_DIR", "./chroma_pccc_text_embedding_3_small"))
 COLLECTION    = os.getenv("CHROMA_COLLECTION", "pccc_vi_text_embedding_3_small")
 VALID_INCLUDE = {"documents","metadatas","distances","embeddings","uris","data"}
@@ -85,7 +91,7 @@ def get_chroma_collection(name: str):
 def _safe_include(items: List[str]):
     return [x for x in items if x in VALID_INCLUDE] or None
 
-# ====== Heuristics modality ======
+# ---------- Heuristics modality ----------
 _TABLE_PAT = re.compile(r"\b(bảng|bang|table|biểu|biểu)\b", re.I | re.U)
 _IMAGE_PAT = re.compile(r"\b(hình|hinh|ảnh|anh|figure|sơ đồ|so do|biểu đồ|biểu đồ)\b", re.I | re.U)
 
@@ -100,7 +106,8 @@ def _infer_modality_from_text(txt: str) -> str:
     if t.startswith("[HÌNH]"): return "image"
     return "text"
 
-# ====== Retrieve (ưu tiên modality bằng where_document khi only_modality=True) ======
+# ---------- Retrieve (dùng where_document để lọc theo nội dung văn bản) ----------
+# Tài liệu: Chroma hỗ trợ where_document với toán tử $contains để lọc trên nội dung document. :contentReference[oaicite:3]{index=3}
 def retrieve(
     query: str,
     collection_name: str,
@@ -114,17 +121,12 @@ def retrieve(
 
     where = None
     where_document = None
-    # Dùng where_document $contains để lọc theo nội dung (tag [BẢNG]/[HÌNH])
-    # Tài liệu Chroma: where_document/$contains dùng để lọc theo nội dung document. 
-    # (Phù hợp vì metadata.modality có thể không tồn tại trong pipeline).  # docs: see citations
     if prefer_modality in {"table", "image"} and only_modality:
         if prefer_modality == "table":
             where_document = {"$contains": "[BẢNG]"}
         elif prefer_modality == "image":
             where_document = {"$contains": "[HÌNH]"}
-    elif prefer_modality == "text" and only_modality:
-        # Không lọc gì thêm; để all rồi rerank
-        where_document = None
+    # prefer_modality="text" thì không lọc cứng; để rerank xử lý.
 
     res = col.query(
         query_embeddings=[qvec],
@@ -143,10 +145,7 @@ def retrieve(
     for i in range(max(len(ids_), len(docs_), len(metas_), len(dists_))):
         doc_text = docs_[i] if i < len(docs_) else ""
         m = metas_[i] if i < len(metas_) else {}
-        modality = (m or {}).get("modality")
-        if not modality:
-            modality = _infer_modality_from_text(doc_text)
-
+        modality = (m or {}).get("modality") or _infer_modality_from_text(doc_text)
         item = {
             "id": ids_[i] if i < len(ids_) else None,
             "distance": dists_[i] if i < len(dists_) else None,
@@ -164,7 +163,7 @@ def retrieve(
             "has_table_html": (m or {}).get("has_table_html"),
             "table_html_excerpt": (m or {}).get("table_html_excerpt"),
             "has_image": (m or {}).get("has_image"),
-            # recency keys:
+            # recency:
             "effective_date": (m or {}).get("effective_date") or (m or {}).get("ngay_hieu_luc"),
             "ban_hanh_date": (m or {}).get("ban_hanh_date") or (m or {}).get("ngay_ban_hanh"),
             "updated_at": (m or {}).get("updated_at"),
@@ -172,10 +171,10 @@ def retrieve(
         out.append(item)
     return {"query": query, "top_k": top_k, "results": out}
 
-# ====== Reranking — module riêng ======
+# ---------- Reranking ----------
 from rerankers import rerank_candidates, infer_query_modality as rr_infer_modality
 
-# ====== Utilities: render bảng ======
+# ---------- Utilities: render bảng ----------
 _HTML_TAG = re.compile(r"<[^>]+>")
 
 def is_markdown_table(text: str) -> bool:
@@ -193,12 +192,10 @@ def extract_markdown_table_from_text(text: str) -> Optional[str]:
     lines = t.splitlines()
     start = -1
     for i, ln in enumerate(lines):
-        if "|" in ln:
-            if i + 1 < len(lines) and re.search(r"-{3,}", lines[i+1]):
-                start = i; break
+        if "|" in ln and i + 1 < len(lines) and re.search(r"-{3,}", lines[i+1]):
+            start = i; break
     if start < 0: return None
-    block = []
-    blanks = 0
+    block, blanks = [], 0
     for j in range(start, len(lines)):
         if not lines[j].strip():
             blanks += 1
@@ -261,19 +258,17 @@ def pick_table_blocks_from_ranked(
         md = extract_markdown_table_from_text(txt)
         if not md and mod == "table":
             html_ex = item.get("table_html_excerpt")
-            if isinstance(html_ex, list) and html_ex:
-                html_ex = html_ex[0]
+            if isinstance(html_ex, list) and html_ex: html_ex = html_ex[0]
             if isinstance(html_ex, str) and html_ex.strip():
                 md = "```html\n" + html_ex.strip() + "\n```"
-        if not md:
-            continue
+        if not md: continue
         md = truncate_markdown_table(md, max_rows=max_rows)
         if max_chars and len(md) > max_chars:
             md = md[:max_chars] + "\n... (cắt bớt theo giới hạn ký tự)"
         out.append((md, build_citation_label(item)))
     return out
 
-# ====== Compose answer ======
+# ---------- Compose answer ----------
 REFUSAL = "Không đủ thông tin từ nguồn đã lập chỉ mục."
 
 def render_sources(ranked: List[Dict[str,Any]]) -> List[str]:
@@ -283,8 +278,7 @@ def render_sources(ranked: List[Dict[str,Any]]) -> List[str]:
 def make_system_prompt(is_table_query: bool) -> str:
     base = (
         "Bạn là trợ lý pháp lý PCCC. Trả lời bằng tiếng Việt, đầy đủ, có cấu trúc, "
-        "chỉ dùng NGỮ CẢNH cung cấp dưới đây; nếu không đủ căn cứ, trả: "
-        f"\"{REFUSAL}\".\n"
+        f"chỉ dùng NGỮ CẢNH cung cấp; nếu không đủ căn cứ, trả: \"{REFUSAL}\".\n"
         "- Chèn trích dẫn dạng [n] trỏ tới danh sách SOURCES ở cuối.\n"
         "- Với câu hỏi về HÌNH: tóm lược nội dung/caption, nêu điều/khoản/điểm và trang.\n"
     )
@@ -292,7 +286,7 @@ def make_system_prompt(is_table_query: bool) -> str:
         base += (
             "- Với câu hỏi về BẢNG: TRƯỚC HẾT hãy in BẢNG (nguyên văn) ở định dạng Markdown (giữ nguyên tiêu đề cột), "
             "sau đó tóm lược điểm chính và nêu căn cứ (điều/khoản/điểm, trang). Nếu context chứa HTML bảng trong "
-            "khối ```html```, hãy chuyển hóa sang bảng Markdown trước khi trả lời.\n"
+            "khối ```html```, hãy chuyển sang bảng Markdown trước khi trả lời.\n"
         )
     return base
 
@@ -349,9 +343,28 @@ def answer_with_llm(query: str, ranked: List[Dict[str,Any]]) -> Dict[str,Any]:
     ans = resp.choices[0].message.content.strip()
     return {"answer": ans, "sources": sources}
 
-# ====== Public API ======
+# ---------- Public API ----------
 def answer_question(query: str, collection: str = COLLECTION, top_k_retrieve: Optional[int] = None,
                     prefer_modality: Optional[str] = None, only_modality: Optional[bool] = None) -> Dict[str,Any]:
+    # 0) Prompt guard
+    if os.getenv("PROMPT_GUARD", "1") == "1":
+        g = guard_prompt(query)
+        if g.get("status") == "empty":
+            return {
+                "answer": "Bạn muốn hỏi nội dung PCCC nào? Ví dụ: 'Nêu các biện pháp phòng cháy chữa cháy cho nhà xưởng'.",
+                "sources": [],
+                "suggestions": g.get("suggestions") or [],
+            }
+        if g.get("status") == "off_topic":
+            sugs = g.get("suggestions") or []
+            hint = ("\n- " + "\n- ".join(sugs)) if sugs else ""
+            return {
+                "answer": ("Câu hỏi hiện chưa thuộc lĩnh vực PCCC. Vui lòng đặt lại câu hỏi liên quan đến PCCC." + hint).strip(),
+                "sources": [],
+                "suggestions": sugs,
+            }
+        query = g.get("normalized_query") or query
+
     if top_k_retrieve is None:
         top_k_retrieve = int(os.getenv("TOPK_RETRIEVE", "20"))
 
@@ -379,7 +392,7 @@ def answer_question(query: str, collection: str = COLLECTION, top_k_retrieve: Op
     if not cands:
         return {"answer": REFUSAL, "sources": []}
 
-    # 2) Re-rank (cross-encoder + priors)
+    # 2) Re-rank
     weights = (
         float(os.getenv("W_CE","0.64")),
         float(os.getenv("W_VEC","0.18")),
@@ -402,7 +415,7 @@ def answer_question(query: str, collection: str = COLLECTION, top_k_retrieve: Op
     # 3) Generate
     return answer_with_llm(query, ranked)
 
-# ====== CLI ======
+# ---------- CLI ----------
 def main():
     p = argparse.ArgumentParser(description="QA Answerer PCCC (retriever → reranker → answerer, in bảng nếu được hỏi)")
     p.add_argument("--query", type=str, default=os.getenv("DEMO_QUERY", ""), help="Câu hỏi để demo")
@@ -411,17 +424,17 @@ def main():
     p.add_argument("--prefer_modality", type=str, default=None, choices=["table","image","text"], help="Ưu tiên modality")
     args = p.parse_args()
 
-    q = args.query.strip()
-    q = "Luật PCCC và CNCH số 55/2024/QH15 được Quốc hội thông qua ngày 29/11/2024, có hiệu lực thi hành từ ngày 01/7/2025, gồm bao nhiêu Chương, Điều"
-    if not q:
-        print("Vui lòng cung cấp --query hoặc đặt DEMO_QUERY.")
-        return
+    q = args.query.strip() or "Cách ăn "
     res = answer_question(q, collection=args.collection, top_k_retrieve=args.top_k, prefer_modality=args.prefer_modality)
-    print("\n--- ANSWER ---\n", res["answer"])
-    if res["sources"] and isinstance(res["sources"], list):
+    print("\n--- ANSWER ---\n", res.get("answer",""))
+    if isinstance(res.get("sources"), list) and res["sources"]:
         print("\n--- SOURCES ---")
         for i, s in enumerate(res["sources"], 1):
             print(f"[{i}] {s}")
+    if isinstance(res.get("suggestions"), list) and res["suggestions"]:
+        print("\n--- SUGGESTIONS ---")
+        for s in res["suggestions"]:
+            print("-", s)
 
 if __name__ == "__main__":
     main()
