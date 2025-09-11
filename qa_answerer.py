@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-QA Answerer cho PCCC (VN) — retrieve → (modality filter) → cross-encoder re-rank → generate
-- Nếu câu hỏi về BẢNG: in chính nội dung bảng (Markdown) từ kho liệu trước, rồi mới giải thích & trích dẫn.
-- Ưu tiên tốt các câu hỏi về BẢNG/HÌNH nhờ modality, table_html_excerpt, vv.
+QA Answerer cho PCCC (VN) — retrieve → (lọc/ưu tiên modality) → rerank (cross-encoder + priors) → generate
+- Nếu câu hỏi về BẢNG: in nguyên văn bảng Markdown trước, rồi mới giải thích & trích dẫn.
+- Ưu tiên văn bản mới (recency) nếu metadata có ngày hiệu lực/ban hành; giảm trùng.
 
 ENV:
   OPENAI_API_KEY
@@ -25,7 +25,9 @@ ENV:
   RERANK_MAX_LEN=512
   TOPK_RERANK=30
   FINAL_K=8
-  W_CE=0.72 W_VEC=0.20 W_PRI=0.08
+
+  # Trọng số rerank (w_ce,w_vec,w_mod,w_rec,w_coh)
+  W_CE=0.64 W_VEC=0.18 W_MOD=0.08 W_REC=0.07 W_COH=0.03
 
   # Render bảng
   TABLE_RENDER_MAX_ROWS=30
@@ -59,7 +61,7 @@ def truncate_tokens(s: str, max_tokens: int) -> str:
     return ENC.decode(ids[:max_tokens])
 
 # ====== OpenAI ======
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")   # OpenAI Embeddings v3 small. :contentReference[oaicite:6]{index=6}
 CHAT_MODEL  = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 
 def get_openai_client() -> OpenAI:
@@ -92,7 +94,7 @@ def infer_query_modality(query: str) -> Optional[str]:
     if _IMAGE_PAT.search(query or ""): return "image"
     return None
 
-# ====== Retrieve (ưu tiên modality cho bảng/hình; không dùng $or 1 phần tử) ======
+# ====== Retrieve (ưu tiên modality cho bảng/hình khi only_modality=True) ======
 def retrieve(
     query: str,
     collection_name: str,
@@ -107,11 +109,13 @@ def retrieve(
     where = None
     where_document = None
     if prefer_modality in {"table", "image", "text"} and only_modality:
+        # Lọc chặt theo modality qua metadata; có thể bổ sung where_document theo tag tiền xử lý
         where = {"modality": {"$eq": prefer_modality}}
         if prefer_modality == "table":
             where_document = {"$contains": "[BẢNG]"}
         elif prefer_modality == "image":
             where_document = {"$contains": "[HÌNH]"}
+    # Tham chiếu Chroma filters: where / where_document. :contentReference[oaicite:7]{index=7}
 
     res = col.query(
         query_embeddings=[qvec],
@@ -146,122 +150,26 @@ def retrieve(
             "has_table_html": (m or {}).get("has_table_html"),
             "table_html_excerpt": (m or {}).get("table_html_excerpt"),
             "has_image": (m or {}).get("has_image"),
+            # recency keys (nếu có) sẽ được dùng ở reranker:
+            "effective_date": (m or {}).get("effective_date") or (m or {}).get("ngay_hieu_luc"),
+            "ban_hanh_date": (m or {}).get("ban_hanh_date") or (m or {}).get("ngay_ban_hanh"),
+            "updated_at": (m or {}).get("updated_at"),
         }
         out.append(item)
     return {"query": query, "top_k": top_k, "results": out}
 
-# ====== Reranking (cross-encoder) ======
-try:
-    from sentence_transformers import CrossEncoder
-except Exception:
-    CrossEncoder = None
-
-RERANK_BACKEND = os.getenv("RERANK_BACKEND", "cross_encoder")  # "cross_encoder"| "none"
-RERANK_MODEL   = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
-RERANK_MAX_LEN = int(os.getenv("RERANK_MAX_LEN", "512"))
-TOPK_RERANK    = int(os.getenv("TOPK_RERANK", "30"))
-FINAL_K        = int(os.getenv("FINAL_K", "8"))
-W_CE = float(os.getenv("W_CE","0.72"))
-W_VEC= float(os.getenv("W_VEC","0.20"))
-W_PRI= float(os.getenv("W_PRI","0.08"))
-
-_HTML_TAG = re.compile(r"<[^>]+>")
-
-def strip_html_keep_space(html: str, max_chars: int = 1200) -> str:
-    if not html: return ""
-    txt = _HTML_TAG.sub(" ", html)
-    txt = re.sub(r"\s+", " ", txt).strip()
-    if max_chars and len(txt) > max_chars:
-        txt = txt[:max_chars] + " ..."
-    return txt
-
-def normalize_distance_to_similarity(distances: List[Optional[float]]) -> List[float]:
-    vals = [d for d in distances if d is not None]
-    if not vals: return [0.0] * len(distances)
-    mn, mx = min(vals), max(vals)
-    if mx <= mn + 1e-12: return [1.0] * len(distances)
-    return [1.0 - ((d - mn)/(mx - mn)) if d is not None else 0.0 for d in distances]
-
-def make_rerank_text(cand: Dict[str,Any]) -> str:
-    txt = cand.get("text") or ""
-    if (cand.get("modality") == "table") or str(txt).lstrip().startswith("[BẢNG]"):
-        html_ex = cand.get("table_html_excerpt")
-        if isinstance(html_ex, list) and html_ex:
-            html_ex = html_ex[0]
-        if isinstance(html_ex, str) and html_ex.strip():
-            txt += "\n[BẢNG_HTML_TRÍCH] " + strip_html_keep_space(html_ex)
-    return txt
-
-def compute_modality_prior(query: str, cands: List[Dict[str,Any]], prefer_modality: Optional[str]) -> List[float]:
-    want = prefer_modality or infer_query_modality(query)
-    out = []
-    for c in cands:
-        mod = (c.get("modality") or "").lower()
-        if want and mod == want:
-            out.append(1.0)
-        elif want == "table" and str(c.get("text","")).lstrip().startswith("[BẢNG]"):
-            out.append(0.9)
-        elif want == "image" and str(c.get("text","")).lstrip().startswith("[HÌNH]"):
-            out.append(0.9)
-        else:
-            out.append(0.0)
-    return out
-
-def fuse_scores(ce_scores: List[float], vec_sims: List[float], pri: List[float], w_ce: float, w_vec: float, w_prior: float) -> List[float]:
-    def _minmax(x):
-        if not x: return x
-        mn, mx = min(x), max(x)
-        if mx <= mn + 1e-12: return [1.0]*len(x)
-        return [(v - mn)/(mx - mn) for v in x]
-    ce_n  = _minmax(ce_scores)
-    vec_n = _minmax(vec_sims)
-    pri_n = _minmax(pri)
-    return [w_ce*ce_n[i] + w_vec*vec_n[i] + w_prior*pri_n[i] for i in range(len(ce_scores))]
-
-def rerank_candidates(
-    query: str,
-    candidates: List[Dict[str,Any]],
-    *,
-    backend: str = RERANK_BACKEND,
-    model_name: str = RERANK_MODEL,
-    max_length: int = RERANK_MAX_LEN,
-    top_k_rerank: int = TOPK_RERANK,
-    final_k: int = FINAL_K,
-    prefer_modality: Optional[str] = None,
-    weights: Tuple[float,float,float] = (W_CE, W_VEC, W_PRI)
-) -> List[Dict[str,Any]]:
-    if not candidates: return []
-    pool = candidates[:min(top_k_rerank, len(candidates))]
-
-    docs_for_ce = [ make_rerank_text(c) for c in pool ]
-    vec_sims = normalize_distance_to_similarity([ c.get("distance") for c in pool ])
-    pri = compute_modality_prior(query, pool, prefer_modality)
-
-    if backend == "cross_encoder":
-        assert CrossEncoder is not None, "Cần cài sentence-transformers để dùng cross-encoder."
-        model = CrossEncoder(model_name, max_length=max_length)
-        ce_scores = model.predict([[query, d] for d in docs_for_ce], convert_to_numpy=True).tolist()
-    else:
-        ce_scores = [0.0]*len(pool)
-
-    w_ce, w_vec, w_prior = weights
-    fused = fuse_scores(ce_scores, vec_sims, pri, w_ce, w_vec, w_prior)
-    for i, c in enumerate(pool):
-        c["score_ce"] = ce_scores[i]
-        c["score_vec"] = vec_sims[i]
-        c["score_prior"] = pri[i]
-        c["score_rerank"] = fused[i]
-    pool.sort(key=lambda x: x["score_rerank"], reverse=True)
-    return pool[:final_k]
+# ====== Reranking — dùng module riêng (cross-encoder + priors) ======
+from rerankers import rerank_candidates, infer_query_modality as rr_infer_modality  # local module
+# Tham chiếu CE usage & BGE reranker. :contentReference[oaicite:8]{index=8}
 
 # ====== Utilities: render bảng ======
+_HTML_TAG = re.compile(r"<[^>]+>")
 
 def is_markdown_table(text: str) -> bool:
     """Heuristic nhận diện bảng Markdown."""
     if not text: return False
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) < 2: return False
-    # cần có dòng có nhiều '|' và có dòng phân cách '---'
     has_bar = any(line.count("|") >= 2 for line in lines[:5])
     has_sep = any(re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", ln) for ln in lines[:6])
     return has_bar and has_sep
@@ -272,22 +180,20 @@ def extract_markdown_table_from_text(text: str) -> Optional[str]:
     t = text.lstrip()
     if t.startswith("[BẢNG]"): t = t[len("[BẢNG]"):].lstrip()
     lines = t.splitlines()
-    # tìm đoạn có bảng (từ header -> separator -> body)
     start = -1
     for i, ln in enumerate(lines):
         if "|" in ln:
-            # kiểm tra dòng sau có separator
             if i + 1 < len(lines) and re.search(r"-{3,}", lines[i+1]):
                 start = i; break
     if start < 0: return None
-    # gom đến khi gặp dòng trống dài hoặc hết
     block = []
+    blanks = 0
     for j in range(start, len(lines)):
         if not lines[j].strip():
-            # cho phép 1-2 dòng trống trong bảng: dừng khi có 2 dòng trống liên tiếp
-            nxt = j+1
-            if nxt < len(lines) and not lines[nxt].strip():
-                break
+            blanks += 1
+            if blanks >= 2: break
+        else:
+            blanks = 0
         block.append(lines[j])
     md = "\n".join(block).strip()
     return md if is_markdown_table(md) else None
@@ -296,7 +202,6 @@ def truncate_markdown_table(md: str, max_rows: int = 30) -> str:
     """Giữ header + separator + N dòng body."""
     lines = [ln for ln in md.splitlines()]
     if len(lines) <= 2: return md
-    # tìm separator (dòng 2 hoặc dòng nào đó có ---)
     sep_idx = -1
     for i, ln in enumerate(lines[:6]):
         if re.search(r"-{3,}", ln): sep_idx = i; break
@@ -308,48 +213,6 @@ def truncate_markdown_table(md: str, max_rows: int = 30) -> str:
         return md
     body_trunc = body[:max_rows] + [f"... (cắt bớt, còn {len(body) - max_rows} dòng)"]
     return "\n".join(header + sep + body_trunc)
-
-def pick_table_blocks_from_ranked(
-    ranked: List[Dict[str,Any]],
-    max_tables: int,
-    max_rows: int,
-    max_chars: int
-) -> List[Tuple[str, str]]:
-    """
-    Trả về list (table_markdown, source_label) lấy từ ranked (ưu tiên modality=table).
-    """
-    out: List[Tuple[str,str]] = []
-    count = 0
-    for item in ranked:
-        if count >= max_tables: break
-        txt = item.get("text") or ""
-        mod = (item.get("modality") or "").lower()
-        md = extract_markdown_table_from_text(txt)
-        if not md and mod == "table":
-            # thử từ HTML excerpt (cho LLM tự render): đặt như code block để không lẫn
-            html_ex = item.get("table_html_excerpt")
-            if isinstance(html_ex, list) and html_ex:
-                html_ex = html_ex[0]
-            if isinstance(html_ex, str) and html_ex.strip():
-                md = "```html\n" + html_ex.strip() + "\n```"
-        if not md:
-            continue
-        md = truncate_markdown_table(md, max_rows=max_rows)
-        if max_chars and len(md) > max_chars:
-            md = md[:max_chars] + "\n... (cắt bớt theo giới hạn ký tự)"
-        out.append((md, build_citation_label(item)))
-        count += 1
-    return out
-
-# ====== Compose answer ======
-REFUSAL = "Không đủ thông tin từ nguồn đã lập chỉ mục."
-
-def uniq_preserve(seq: List[str]) -> List[str]:
-    seen = set(); out = []
-    for x in seq:
-        if not x or x in seen: continue
-        seen.add(x); out.append(x)
-    return out
 
 def build_citation_label(item: Dict[str,Any]) -> str:
     segs = []
@@ -367,6 +230,44 @@ def build_citation_label(item: Dict[str,Any]) -> str:
         label += f" | trang {a}–{b}" if (a is not None and b is not None and a != b) else (f" | trang {a}" if a is not None else "")
     return label or (item.get("citation") or "")
 
+def uniq_preserve(seq: List[str]) -> List[str]:
+    seen = set(); out = []
+    for x in seq:
+        if not x or x in seen: continue
+        seen.add(x); out.append(x)
+    return out
+
+def pick_table_blocks_from_ranked(
+    ranked: List[Dict[str,Any]],
+    max_tables: int,
+    max_rows: int,
+    max_chars: int
+) -> List[Tuple[str, str]]:
+    """Trả về list (table_markdown, source_label) lấy từ ranked (ưu tiên modality=table)."""
+    out: List[Tuple[str,str]] = []
+    for item in ranked:
+        if len(out) >= max_tables: break
+        txt = item.get("text") or ""
+        mod = (item.get("modality") or "").lower()
+        md = extract_markdown_table_from_text(txt)
+        if not md and mod == "table":
+            html_ex = item.get("table_html_excerpt")
+            if isinstance(html_ex, list) and html_ex:
+                html_ex = html_ex[0]
+            if isinstance(html_ex, str) and html_ex.strip():
+                # giữ nguyên HTML ở code block; LLM sẽ chuyển sang Markdown theo hướng dẫn prompt
+                md = "```html\n" + html_ex.strip() + "\n```"
+        if not md: 
+            continue
+        md = truncate_markdown_table(md, max_rows=max_rows)
+        if max_chars and len(md) > max_chars:
+            md = md[:max_chars] + "\n... (cắt bớt theo giới hạn ký tự)"
+        out.append((md, build_citation_label(item)))
+    return out
+
+# ====== Compose answer ======
+REFUSAL = "Không đủ thông tin từ nguồn đã lập chỉ mục."
+
 def render_sources(ranked: List[Dict[str,Any]]) -> List[str]:
     labs = [ build_citation_label(x) for x in ranked ]
     return uniq_preserve(labs)
@@ -374,10 +275,10 @@ def render_sources(ranked: List[Dict[str,Any]]) -> List[str]:
 def make_system_prompt(is_table_query: bool) -> str:
     base = (
         "Bạn là trợ lý pháp lý PCCC. Trả lời bằng tiếng Việt, đầy đủ, có cấu trúc, "
-        "ưu tiên căn cứ từ văn bản mới nhất. Nếu không đủ căn cứ, trả: "
+        "chỉ dùng NGỮ CẢNH cung cấp dưới đây; nếu không đủ căn cứ, trả: "
         f"\"{REFUSAL}\".\n"
         "- Chèn trích dẫn dạng [n] trỏ tới danh sách SOURCES ở cuối.\n"
-        "- Với câu hỏi về HÌNH: tóm lược nội dung caption/ngữ cảnh, nêu rõ điều/khoản/điểm và trang.\n"
+        "- Với câu hỏi về HÌNH: tóm lược nội dung/caption, nêu điều/khoản/điểm và trang.\n"
     )
     if is_table_query:
         base += (
@@ -385,16 +286,16 @@ def make_system_prompt(is_table_query: bool) -> str:
             "sau đó tóm lược điểm chính và nêu căn cứ (điều/khoản/điểm, trang). Nếu context chứa HTML bảng trong "
             "khối ```html```, hãy chuyển hóa sang bảng Markdown trước khi trả lời.\n"
         )
-    return base
+    return base  # RAG prompting guideline: “use only provided context / refuse otherwise”. :contentReference[oaicite:9]{index=9}
 
 def make_user_prompt(query: str, contexts: List[str], sources: List[str], table_blocks: List[Tuple[str,str]], is_table_query: bool) -> List[Dict[str,str]]:
-    # Ghép context theo dạng đánh số để dễ dẫn [n]
+    # Đánh số context để map [n]
     ctx_blocks = []
     for i, (ctx, src) in enumerate(zip(contexts, sources), 1):
         ctx_blocks.append(f"[{i}] SOURCE: {src}\nEXCERPT:\n{ctx}")
     ctx_text = "\n\n".join(ctx_blocks)
 
-    # Nếu có bảng, truyền thêm khối BẢNG để LLM dùng trực tiếp
+    # Bảng (nếu có)
     tbl_text = ""
     if is_table_query and table_blocks:
         tbl_lines = []
@@ -405,11 +306,11 @@ def make_user_prompt(query: str, contexts: List[str], sources: List[str], table_
     user = (
         f"CÂU HỎI: {query}\n\n"
         + (f"BẢNG NGUYÊN VĂN (để bạn sử dụng, nếu phù hợp):\n{tbl_text}\n\n" if tbl_text else "")
-        + f"NGỮ CẢNH (trích từ kho liệu, có thể chứa [BẢNG]/[HÌNH] hoặc ```html``` cho bảng):\n{ctx_text}\n\n"
+        + f"NGỮ CẢNH (trích từ kho liệu):\n{ctx_text}\n\n"
         "YÊU CẦU TRẢ LỜI:\n"
-        "- Nếu có bảng phù hợp: in bảng (Markdown) trước, rồi giải thích/đối chiếu căn cứ. Nếu có nhiều bảng, chọn bảng phù hợp nhất.\n"
-        "- Trả lời rõ ràng, từng ý; nêu điều/khoản/điểm, trang; chèn chỉ mục [n] cho mệnh đề có căn cứ.\n"
-        "- Nếu văn bản mới và cũ khác nhau, hãy ưu tiên văn bản mới và nêu rõ sự khác biệt.\n"
+        "- Nếu có bảng phù hợp: in bảng Markdown trước, rồi giải thích/đối chiếu căn cứ. Nếu nhiều bảng, chọn bảng phù hợp nhất.\n"
+        "- Trả lời rõ ràng, từng ý; nêu điều/khoản/điểm, trang; chèn chỉ mục [n] cho câu/ý có căn cứ.\n"
+        "- Nếu văn bản mới và cũ khác nhau, hãy ưu tiên văn bản mới và nêu rõ khác biệt.\n"
         "- Nếu không đủ căn cứ: trả đúng thông điệp chuẩn."
     )
     return [
@@ -421,14 +322,9 @@ def answer_with_llm(query: str, ranked: List[Dict[str,Any]]) -> Dict[str,Any]:
     if not ranked:
         return {"answer": REFUSAL, "sources": []}
 
-    # Chuẩn bị ngữ cảnh
-    contexts = []
-    for x in ranked:
-        txt = x.get("text") or ""
-        contexts.append(txt.strip())
-    sources = render_sources(ranked)
+    contexts = [(x.get("text") or "").strip() for x in ranked]
+    sources  = render_sources(ranked)
 
-    # Chuẩn bị khối bảng để LLM in ra trực tiếp
     is_table_query = (infer_query_modality(query) == "table") or any((x.get("modality")=="table") for x in ranked[:2])
     max_rows  = int(os.getenv("TABLE_RENDER_MAX_ROWS", "30"))
     max_tabs  = int(os.getenv("TABLE_RENDER_MAX_TABLES", "2"))
@@ -448,7 +344,7 @@ def answer_with_llm(query: str, ranked: List[Dict[str,Any]]) -> Dict[str,Any]:
     return {"answer": ans, "sources": sources}
 
 # ====== Public API ======
-def answer_question(query: str, collection: str = COLLECTION, top_k_retrieve: int = None,
+def answer_question(query: str, collection: str = COLLECTION, top_k_retrieve: Optional[int] = None,
                     prefer_modality: Optional[str] = None, only_modality: Optional[bool] = None) -> Dict[str,Any]:
     if top_k_retrieve is None:
         top_k_retrieve = int(os.getenv("TOPK_RETRIEVE", "20"))
@@ -477,22 +373,28 @@ def answer_question(query: str, collection: str = COLLECTION, top_k_retrieve: in
     if not cands:
         return {"answer": REFUSAL, "sources": []}
 
-    # 2) Re-rank
+    # 2) Re-rank (cross-encoder + priors)
+    weights = (
+        float(os.getenv("W_CE","0.64")),
+        float(os.getenv("W_VEC","0.18")),
+        float(os.getenv("W_MOD","0.08")),
+        float(os.getenv("W_REC","0.07")),
+        float(os.getenv("W_COH","0.03")),
+    )
     ranked = rerank_candidates(
         query=query,
         candidates=cands,
-        backend=RERANK_BACKEND,
-        model_name=RERANK_MODEL,
-        max_length=RERANK_MAX_LEN,
-        top_k_rerank=TOPK_RERANK,
-        final_k=FINAL_K,
+        backend=os.getenv("RERANK_BACKEND","cross_encoder"),
+        model_name=os.getenv("RERANK_MODEL","BAAI/bge-reranker-v2-m3"),
+        max_length=int(os.getenv("RERANK_MAX_LEN","512")),
+        top_k_rerank=int(os.getenv("TOPK_RERANK","30")),
+        final_k=int(os.getenv("FINAL_K","8")),
         prefer_modality=prefer_modality,
-        weights=(W_CE, W_VEC, W_PRI),
+        weights=weights,
     )
 
     # 3) Generate
-    out = answer_with_llm(query, ranked)
-    return out
+    return answer_with_llm(query, ranked)
 
 # ====== CLI ======
 def main():
@@ -501,15 +403,14 @@ def main():
     p.add_argument("--collection", type=str, default=COLLECTION, help="Tên collection Chroma")
     p.add_argument("--top_k", type=int, default=int(os.getenv("TOPK_RETRIEVE","20")))
     p.add_argument("--prefer_modality", type=str, default=None, choices=["table","image","text"], help="Ưu tiên modality")
-    p.add_argument("--only_modalility", action="store_true", help="(deprecated) Không dùng; dùng ONLY_MODALITY/STRICT_TABLE_RETRIEVE qua ENV")
     args = p.parse_args()
 
     q = args.query.strip()
-    q = "Bảng Chiều dài của bãi đỗ xe chữa cháy đối với nhà nhóm F5"
+    q = "Quy định kỹ thuật về Máy bơm chữa cháy"
     if not q:
         print("Vui lòng cung cấp --query hoặc đặt DEMO_QUERY.")
         return
-    res = answer_question(q, collection=args.collection, top_k_retrieve=args.top_k)
+    res = answer_question(q, collection=args.collection, top_k_retrieve=args.top_k, prefer_modality=args.prefer_modality)
     print("\n--- ANSWER ---\n", res["answer"])
     if res["sources"]:
         print("\n--- SOURCES ---")

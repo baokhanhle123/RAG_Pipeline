@@ -2,53 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-Index incremental chunks (DOC/DOCX/PDF) vào Chroma bằng OpenAI Embeddings,
-tối ưu cho câu hỏi về BẢNG & HÌNH. Vá lỗi 'max_tokens_per_request' bằng batching theo ngân sách token.
+Index incremental chunks (DOC/DOCX/PDF) vào Chroma bằng OpenAI Embeddings.
+- Batching theo ngân sách token + fallback chia đôi khi dính 'max_tokens_per_request'.
+- Retry/backoff khi gặp RateLimit/Timeout/5xx.
+- Tự gán metadata 'modality' (table/image/text) + (tùy chọn) collection phụ cho TABLE/IMAGE (tái dùng vector).
+- Kiểm tra 'citation' để đảm bảo trích dẫn chuẩn từ smart chunking.
 
-Đầu vào: pccc_chunks.jsonl (từ chunk_pccc_smart.py), mỗi dòng:
-{
-  "chunk_id": "...",
-  "text": "...",                     # có thể bắt đầu bằng [BẢNG] / [HÌNH]
-  "doc_id": "...",
-  "source_sha1": "...",
-  "metadata": {
-      "citation": "...",
-      "van_ban": "...",
-      "dieu": "...", "khoan": "...", "diem": "...",
-      "page_start": ..., "page_end": ...,
-      "has_table_html": true/false,
-      "table_html_excerpt": "...|[...]",
-      "has_image": true/false,
-      ...
-  }
-}
-
-Hành vi:
-- Chỉ ingest các nguồn (source_sha1) mới (skip trùng trong DB).
-- Tự động gán metadata "modality": table | image | text.
-- (Tuỳ chọn) Nhân bản ghi vào collection phụ cho TABLE/IMAGE khi SPLIT_BY_MODALITY=1
-  và tái sử dụng vector (không embed lần 2).
-- Cắt token per-input (MAX_EMBED_TOKENS ~ 8k) và gom batch theo ngân sách tổng
-  (MAX_EMBED_TOTAL_TOKENS ~ 280k), fallback chia đôi khi gặp 'max_tokens_per_request'.
-- Demo truy hồi có thể ưu tiên bảng/hình qua where / where_document.
-
-Tham chiếu:
-- OpenAI Embeddings Guide / Cookbook cho xử lý input dài & batch nhiều mục.
-- Chroma: metadata filters & where_document.
+Tham khảo:
+- Chroma where / where_document filter khi truy vấn.  # docs.trychroma.com
+- New OpenAI embeddings (text-embedding-3-small/large). # openai.com blog
 """
 
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Any
-import argparse
-import json
-import os
-import sys
-import hashlib
-import time
+import argparse, json, os, sys, hashlib, time, math, random
 
 import chromadb
-from openai import OpenAI, BadRequestError
+import openai as openai_root
+from openai import OpenAI, BadRequestError  # dùng BadRequestError riêng
+import math 
+# Các lỗi còn lại lấy từ module openai_root để tương thích nhiều phiên bản
 
 # -----------------------------
 # Cấu hình & biến môi trường
@@ -56,24 +30,15 @@ from openai import OpenAI, BadRequestError
 
 PERSIST_DIR = Path(os.getenv("CHROMA_DIR", "./chroma_pccc_text_embedding_3_small"))
 COLLECTION  = os.getenv("CHROMA_COLLECTION", "pccc_vi_text_embedding_3_small")
-
-# Khi bật, tạo/ghi thêm vào 2 collection phụ: *_tables, *_images
 SPLIT_BY_MODALITY = os.getenv("SPLIT_BY_MODALITY", "0") == "1"
-
 JSONL_CHUNKS = Path(os.getenv("PCCC_CHUNKS", "./pccc_chunks.jsonl"))
-
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
-# Số phần tử tối đa trong 1 batch (mức chặn trên số lượng)
 BATCH_EMBED = int(os.getenv("BATCH_EMBED", "96"))
-
-# Tổng token tối đa cho MỖI request embeddings (buffer an toàn dưới ngưỡng ~300k)
-MAX_EMBED_TOTAL_TOKENS = int(os.getenv("MAX_EMBED_TOTAL_TOKENS", "280000"))
-
-# Per-input (đã cắt trước khi gửi, an toàn ~8192 tokens cho text-embedding-3-*)
-MAX_EMBED_TOKENS = int(os.getenv("MAX_EMBED_TOKENS", "8000"))
-
+MAX_EMBED_TOTAL_TOKENS = int(os.getenv("MAX_EMBED_TOTAL_TOKENS", "280000"))  # an toàn < ~300k community-observed
+MAX_EMBED_TOKENS = int(os.getenv("MAX_EMBED_TOKENS", "8000"))  # an toàn ~8k/input
 PRINT_EVERY = int(os.getenv("PRINT_EVERY", "1000"))
+SCHEMA_VERSION = os.getenv("PCCC_SCHEMA_VERSION", "pccc_chunks/v1.1")
 
 VALID_INCLUDE = {"documents", "embeddings", "metadatas", "distances", "uris", "data"}
 
@@ -94,7 +59,6 @@ except Exception:
 
 def tok_len(s: str) -> int:
     if ENC is None:
-        # xấp xỉ khi thiếu tokenizer, chỉ để chia batch; vẫn an toàn vì có fallback
         return max(1, len(s)//2)
     return len(ENC.encode(s or ""))
 
@@ -137,14 +101,11 @@ def group_chunks_by_source_sha1(path: Path) -> Dict[str, List[dict]]:
 # -----------------------------
 
 def get_persistent_client() -> chromadb.ClientAPI:
+    PERSIST_DIR.mkdir(parents=True, exist_ok=True)
     return chromadb.PersistentClient(path=str(PERSIST_DIR))
 
 def get_or_create_collection(client: chromadb.ClientAPI, name: str):
     return client.get_or_create_collection(name=name)
-
-def chroma_has_source(collection, source_sha1: str) -> bool:
-    res = collection.get(where={"source_sha1": {"$eq": source_sha1}}, limit=1)
-    return len(res.get("ids") or []) > 0
 
 def chroma_has_any(collection, sha1_list: List[str]) -> Dict[str, bool]:
     present: Dict[str, bool] = {}
@@ -172,22 +133,54 @@ def _to_scalar(v: Any) -> Any:
     except Exception:
         return str(v)
 
+
 def sanitize_metadata(md: dict) -> dict:
+    """
+    Chuẩn hóa metadata để tương thích Chroma:
+    - Bỏ key có value None
+    - Bỏ float NaN/Inf
+    - Giữ nguyên str/int/float/bool
+    - Với list/dict/... -> json.dumps(...) (str)
+    """
     if not md:
-        return {}
-    return {str(k): _to_scalar(v) for k, v in md.items()}
+        return {"schema_version": SCHEMA_VERSION}
+
+    out = {}
+    for k, v in md.items():
+        key = str(k)
+
+        # 1) loại None
+        if v is None:
+            continue
+
+        # 2) số đặc biệt: NaN/Inf -> bỏ
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            continue
+
+        # 3) các kiểu được phép
+        if isinstance(v, (str, int, float, bool)):
+            out[key] = v
+            continue
+
+        # 4) mọi thứ khác -> stringify an toàn
+        try:
+            out[key] = json.dumps(v, ensure_ascii=False)
+        except Exception:
+            out[key] = str(v)
+
+    out["schema_version"] = SCHEMA_VERSION
+    return out
+
 
 def _starts_with(s: str, prefix: str) -> bool:
     return (s or "").lstrip().startswith(prefix)
 
 def detect_modality(text: str, md: dict) -> str:
-    # Table?
     ht = md.get("has_table_html")
     if isinstance(ht, str):
         ht = ht.lower() in ("1", "true", "yes")
     if ht or _starts_with(text, "[BẢNG]") or _starts_with(text, "[BANG]"):
         return "table"
-    # Image?
     hi = md.get("has_image")
     if isinstance(hi, str):
         hi = hi.lower() in ("1", "true", "yes")
@@ -196,22 +189,21 @@ def detect_modality(text: str, md: dict) -> str:
     return "text"
 
 # -----------------------------
-# Embedding với token-budget batching + fallback chia đôi
+# Embedding: token-budget batching + retry/backoff
 # -----------------------------
 
+def _call_embeddings(client: OpenAI, model: str, inputs: List[str]) -> List[List[float]]:
+    r = client.embeddings.create(model=model, input=inputs)
+    return [d.embedding for d in r.data]
+
 def _call_embeddings_with_split_on_error(client: OpenAI, model: str, inputs: List[str]) -> List[List[float]]:
-    """
-    Gọi embeddings cho 'inputs' (đã được cắt per-input).
-    Nếu dính lỗi 'max_tokens_per_request', chia đôi lô và thử lại đệ quy.
-    """
     try:
-        r = client.embeddings.create(model=model, input=inputs)
-        return [d.embedding for d in r.data]
+        return _call_embeddings(client, model, inputs)
     except BadRequestError as e:
         msg = (getattr(e, "message", None) or str(e) or "").lower()
         if ("max_tokens_per_request" in msg) or ("per request" in msg and "tokens" in msg):
             if len(inputs) == 1:
-                # Với 1 phần tử mà vẫn lỗi => cần giảm MAX_EMBED_TOKENS thêm hoặc raise để dev xử lý
+                # input đơn vẫn quá to → để dev điều chỉnh MAX_EMBED_TOKENS
                 raise
             mid = len(inputs) // 2
             left  = _call_embeddings_with_split_on_error(client, model, inputs[:mid])
@@ -219,56 +211,71 @@ def _call_embeddings_with_split_on_error(client: OpenAI, model: str, inputs: Lis
             return left + right
         raise
 
+def _retryable_embed_batch(client: OpenAI, model: str, inputs: List[str], max_retries: int = 6) -> List[List[float]]:
+    """
+    Retry/backoff cho RateLimit/Timeout/5xx. Jitter để tránh thác yêu cầu.
+    """
+    base = 1.2
+    for attempt in range(max_retries):
+        try:
+            return _call_embeddings_with_split_on_error(client, model, inputs)
+        except (openai_root.RateLimitError,
+                openai_root.APIConnectionError,
+                openai_root.APITimeoutError) as e:
+            sleep = base ** attempt + random.uniform(0, 0.6)
+            print(f"[WARN] Embed retry ({type(e).__name__}) in {sleep:.1f}s (attempt {attempt+1}/{max_retries})")
+            time.sleep(sleep)
+            continue
+        except openai_root.APIError as e:
+            # 5xx → retry; 4xx (khác BadRequest đã xử lý ở trên) → raise
+            status = getattr(e, "status_code", None) or getattr(e, "status", None)
+            if status and int(status) >= 500:
+                sleep = base ** attempt + random.uniform(0, 0.6)
+                print(f"[WARN] Embed 5xx retry in {sleep:.1f}s")
+                time.sleep(sleep); continue
+            raise
+    raise RuntimeError("Embeddings failed after retries")
+
 def embed_texts_safe(client: OpenAI, texts: List[str], model: str) -> List[List[float]]:
-    """
-    - Cắt per-input (MAX_EMBED_TOKENS)
-    - Gom lô theo ngân sách token (MAX_EMBED_TOTAL_TOKENS) + giới hạn BATCH_EMBED
-    - Fallback chia đôi khi gặp 'max_tokens_per_request'
-    """
     cut_texts = [truncate_tokens(t or "", MAX_EMBED_TOKENS) for t in texts]
     lengths = [tok_len(t) for t in cut_texts]
-
     out: List[List[float]] = []
     i = 0
     while i < len(cut_texts):
-        total_tok = 0
-        cnt = 0
-        j = i
+        total_tok = 0; cnt = 0; j = i
         while j < len(cut_texts) and cnt < BATCH_EMBED:
             need = lengths[j]
             if need > MAX_EMBED_TOTAL_TOKENS:
-                # Trường hợp hiếm: một input sau cắt vẫn quá lớn so với ngân sách "per-request".
-                # Gửi đơn lẻ để fallback chia đôi xử lý nếu cần.
                 if cnt == 0:
                     j = j + 1
                 break
             if total_tok + need > MAX_EMBED_TOTAL_TOKENS:
                 break
-            total_tok += need
-            cnt += 1
-            j += 1
-
-        if j == i:  # không nhét nổi phần tử hiện tại vào batch (do ngân sách), gửi đơn lẻ
+            total_tok += need; cnt += 1; j += 1
+        if j == i:  # không nhét nổi → gửi đơn lẻ
             j = i + 1
-
         sub_inputs = cut_texts[i:j]
-        vecs = _call_embeddings_with_split_on_error(client, model, sub_inputs)
+        vecs = _retryable_embed_batch(client, model, sub_inputs)
         out.extend(vecs)
         i = j
-
     return out
 
 # -----------------------------
 # Ingest incremental (+ modality split optional, reuse vectors)
 # -----------------------------
 
+def _validate_row(r: dict) -> Optional[str]:
+    if not r.get("text"):
+        return "missing text"
+    md = r.get("metadata") or {}
+    if not md.get("citation"):
+        return "missing citation"
+    return None
+
 def ingest_chunks_to_chroma(
     chunks_jsonl: Path,
     collection_name: str,
 ) -> Tuple[int, int, int, Optional[int]]:
-    """
-    Trả về: (n_sources_total, n_sources_new, n_chunks_upserted, dim)
-    """
     assert chunks_jsonl.exists(), f"Không thấy file: {chunks_jsonl}"
 
     client_oai = get_openai_client()
@@ -276,7 +283,6 @@ def ingest_chunks_to_chroma(
 
     base_col = get_or_create_collection(client_chroma, collection_name)
 
-    # Optional: collections phụ (tables/images)
     tables_col = images_col = None
     if SPLIT_BY_MODALITY:
         tables_col = get_or_create_collection(client_chroma, f"{collection_name}_tables")
@@ -296,25 +302,25 @@ def ingest_chunks_to_chroma(
     emb_dim: Optional[int] = None
 
     for idx, sha1 in enumerate(sha1_list, 1):
-        if present_map.get(sha1) or chroma_has_source(base_col, sha1):
+        if present_map.get(sha1):
             print(f"[SKIP] Source đã tồn tại (SHA1={sha1[:12]}...)")
             continue
 
         rows = groups[sha1]
-        # de-dup chunk_id
         uniq: Dict[str, dict] = {}
+        bad = 0
         for r in rows:
+            err = _validate_row(r)
+            if err:
+                bad += 1
+                continue
             cid = r.get("chunk_id") or hashlib.sha1((sha1 + "|" + (r.get("text") or "")).encode("utf-8")).hexdigest()[:16]
             uniq[cid] = r
         rows = list(uniq.values())
+        if bad:
+            print(f"[WARN] Bỏ {bad} dòng thiếu metadata/citation ở source {sha1[:12]}")
 
-        # chuẩn bị batch cho base collection
-        ids: List[str] = []
-        docs: List[str] = []
-        metas: List[dict] = []
-        modalities: List[str] = []
-
-        # và danh sách cho modality phụ (sẽ tái dùng vector ngay sau khi tính)
+        ids: List[str] = []; docs: List[str] = []; metas: List[dict] = []; modalities: List[str] = []
         ids_table: List[str] = []; docs_table: List[str] = []; metas_table: List[dict] = []; vecs_table: List[List[float]] = []
         ids_image: List[str] = []; docs_image: List[str] = []; metas_image: List[dict] = []; vecs_image: List[List[float]] = []
 
@@ -325,22 +331,13 @@ def ingest_chunks_to_chroma(
             md = sanitize_metadata(md_raw)
             md["source_sha1"] = sha1
             if r.get("doc_id"): md["doc_id"] = r["doc_id"]
+            modality = detect_modality(text, md_raw)
+            md["modality"] = modality
+            ids.append(str(cid)); docs.append(text); metas.append(md); modalities.append(modality)
 
-            modality = detect_modality(text, md_raw)  # dùng md_raw để đọc bool thật; metadata lưu bản sanitize
-            md["modality"] = modality  # để filter nhanh
-
-            ids.append(str(cid))
-            docs.append(text)
-            metas.append(md)
-            modalities.append(modality)
-
-        # Embed + upsert theo batch, đồng thời gom vecs cho tables/images để reuse
+        # Embed + upsert theo batch
         for i in range(0, len(ids), BATCH_EMBED):
-            sub_ids   = ids[i:i+BATCH_EMBED]
-            sub_docs  = docs[i:i+BATCH_EMBED]
-            sub_metas = metas[i:i+BATCH_EMBED]
-            sub_mods  = modalities[i:i+BATCH_EMBED]
-
+            sub_ids, sub_docs, sub_metas, sub_mods = ids[i:i+BATCH_EMBED], docs[i:i+BATCH_EMBED], metas[i:i+BATCH_EMBED], modalities[i:i+BATCH_EMBED]
             vecs = embed_texts_safe(client_oai, sub_docs, EMBED_MODEL)
             if emb_dim is None and vecs:
                 emb_dim = len(vecs[0])
@@ -355,7 +352,6 @@ def ingest_chunks_to_chroma(
                     elif _mod == "image":
                         ids_image.append(sub_ids[k]); docs_image.append(sub_docs[k]); metas_image.append(sub_metas[k]); vecs_image.append(vecs[k])
 
-        # Upsert vào collection phụ (nếu có) — tái dùng vector đã tính
         if SPLIT_BY_MODALITY and tables_col and ids_table:
             for i in range(0, len(ids_table), 2048):
                 tables_col.upsert(
@@ -385,12 +381,12 @@ def ingest_chunks_to_chroma(
     return (n_sources_total, n_sources_new, n_upserted, emb_dim)
 
 # -----------------------------
-# Retrieve (demo) — hỗ trợ ưu tiên bảng/hình
+# Retrieve (demo) — ưu tiên bảng/hình
 # -----------------------------
 
+VALID_INCLUDE = {"documents", "metadatas", "distances"}
 def _safe_include(items):
-    if not items:
-        return None
+    if not items: return None
     return [x for x in items if x in VALID_INCLUDE] or None
 
 def embed_query(client: OpenAI, q: str, model: str) -> List[float]:
@@ -401,21 +397,19 @@ def retrieve(
     query: str,
     collection_name: str,
     top_k: int = 5,
-    prefer_modality: Optional[str] = None,   # None | "table" | "image" | "text"
+    prefer_modality: Optional[str] = None,   # None|"table"|"image"|"text"
     only_modality: bool = False,
 ) -> Dict[str, Any]:
     client_oai = get_openai_client()
     qvec = embed_query(client_oai, query, EMBED_MODEL)
-
     client_chroma = get_persistent_client()
     collection = client_chroma.get_or_create_collection(name=collection_name)
 
-    where = None
-    where_document = None
+    where = None; where_document = None
     if prefer_modality in {"table", "image", "text"}:
         where = {"modality": {"$eq": prefer_modality}} if only_modality else {"$or": [{"modality": {"$eq": prefer_modality}}]}
         if prefer_modality == "table":
-            where_document = {"$contains": "[BẢNG]"}
+            where_document = {"$contains": "[BẢNG]"}  # full-text filter vào nội dung
         elif prefer_modality == "image":
             where_document = {"$contains": "[HÌNH]"}
 
@@ -425,7 +419,7 @@ def retrieve(
         n_results=top_k,
         where=where,
         where_document=where_document,
-        include=include_fields,  # ids luôn có trong kết quả
+        include=include_fields,
     )
 
     out = []
@@ -460,13 +454,13 @@ def retrieve(
 # -----------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Index incremental chunks (DOC/DOCX/PDF) vào Chroma (ưu tiên bảng/hình)")
+    p = argparse.ArgumentParser(description="Index incremental chunks vào Chroma (ưu tiên bảng/hình)")
     p.add_argument("--chunks", type=str, default=str(JSONL_CHUNKS), help="Đường dẫn pccc_chunks.jsonl")
     p.add_argument("--collection", type=str, default=COLLECTION, help="Tên collection Chroma")
-    p.add_argument("--demo_query", type=str, default=os.getenv("DEMO_QUERY", ""), help="Chuỗi truy vấn demo sau khi ingest")
-    p.add_argument("--top_k", type=int, default=5, help="Số kết quả khi demo retrieve")
-    p.add_argument("--prefer_modality", type=str, choices=["table","image","text"], default=None, help="Ưu tiên loại chunk khi truy hồi")
-    p.add_argument("--only_modality", action="store_true", help="Chỉ lấy đúng modality đã chọn (lọc chặt)")
+    p.add_argument("--demo_query", type=str, default=os.getenv("DEMO_QUERY", ""), help="Truy vấn demo sau khi ingest")
+    p.add_argument("--top_k", type=int, default=5)
+    p.add_argument("--prefer_modality", type=str, choices=["table","image","text"], default=None)
+    p.add_argument("--only_modality", action="store_true")
     return p.parse_args()
 
 def main():
@@ -491,9 +485,8 @@ def main():
             if r.get("khoan"): segs.append(f"Khoản {r['khoan']}")
             if r.get("diem"): segs.append(f"Điểm {r['diem']}")
             label = " — ".join([label_parts[0], ", ".join(segs)]) if (label_parts and segs) else (label_parts[0] if label_parts else ", ".join(segs))
-            dist = r.get("distance")
-            mod = r.get("modality") or "text"
-            print(f"- [{mod.upper()}] {label or 'Văn bản'} | dist={dist:.4f}" if dist is not None else f"- [{mod.upper()}] {label or 'Văn bản'}")
+            dist = r.get("distance"); mod = r.get("modality") or "text"
+            print(f"- [{mod.upper()}] {label or 'Văn bản'} | dist={dist:.4f}" if dist is not None else f"- [{mod.UPPER()}] {label or 'Văn bản'}")
             txt = (r.get("text") or "").strip().replace("\n", " ")
             print("  →", (txt[:240] + ("..." if len(txt) > 240 else "")))
         print()
