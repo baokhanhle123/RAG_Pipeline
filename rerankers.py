@@ -1,8 +1,7 @@
-# /home/khanhle/RAG_Pipeline/rerankers.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
-import os, re, math
+import os, re
 from datetime import datetime, timezone
 
 try:
@@ -46,18 +45,19 @@ _CE_MODEL = None
 def _get_ce_model(model_name: str, max_length: int):
     global _CE_MODEL
     if _CE_MODEL is None:
-        assert CrossEncoder is not None, "Bạn cần cài sentence-transformers để dùng CrossEncoder."
+        if CrossEncoder is None:
+            raise RuntimeError("Cần cài sentence-transformers để dùng CrossEncoder (pip install sentence-transformers).")
         _CE_MODEL = CrossEncoder(model_name, max_length=max_length)
     return _CE_MODEL
 
 # ===== Chuẩn hoá văn bản đầu vào reranker (ưu ái bảng/hình) =====
 def make_rerank_text(candidate: Dict[str, Any]) -> str:
     """
-    candidate: 1 item từ bước retrieve() của bạn (đã flatten).
+    candidate: 1 item từ bước retrieve() (đã flatten).
     """
     txt = candidate.get("text") or ""
     md = candidate
-    # Nếu là BẢNG: thêm trích từ HTML (nếu có) để cross-encoder “thấy” tiêu đề cột/giá trị
+    # Nếu là BẢNG: thêm trích từ HTML (nếu có) để CE thấy tiêu đề cột/giá trị
     if (md.get("modality") == "table" or str(txt).lstrip().startswith("[BẢNG]")):
         html_ex = md.get("table_html_excerpt")
         if isinstance(html_ex, list) and html_ex:
@@ -92,14 +92,12 @@ _DATE_KEYS = ["effective_date", "ngay_hieu_luc", "ban_hanh_date", "ngay_ban_hanh
 def _parse_any_date(s: Any) -> Optional[datetime]:
     if not s: return None
     if isinstance(s, (int, float)):
-        # epoch seconds?
         if s > 1e12: s = s / 1000.0
         try:
             return datetime.fromtimestamp(float(s), tz=timezone.utc)
         except Exception:
             return None
     ss = str(s).strip()
-    # Thử các định dạng phổ biến
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y"):
         try:
             dt = datetime.strptime(ss, fmt)
@@ -109,24 +107,21 @@ def _parse_any_date(s: Any) -> Optional[datetime]:
     return None
 
 def compute_recency_prior(cands: List[Dict[str, Any]]) -> List[float]:
-    # lấy ngày mới nhất trong tập làm mốc
     dates = []
     for c in cands:
-        md = c
         dt = None
         for k in _DATE_KEYS:
-            dt = _parse_any_date(md.get(k))
+            dt = _parse_any_date(c.get(k))
             if dt: break
         dates.append(dt)
-    # chuẩn hoá về [0,1] (mới nhất = 1.0)
     vals = [int(d.timestamp()) if d else None for d in dates]
     nums = [v for v in vals if v is not None]
     if not nums:
         return [0.0]*len(cands)
     mn, mx = min(nums), max(nums)
-    if mx <= mn: 
+    if mx <= mn:
         return [1.0 if v is not None else 0.0 for v in vals]
-    return [ ( (v - mn) / (mx - mn) ) if v is not None else 0.0 for v in vals]
+    return [ ((v - mn)/(mx - mn)) if v is not None else 0.0 for v in vals]
 
 # ===== Prior 3: cohesion theo cùng 'van_ban' (khuyến khích nhóm nguồn nhất quán) =====
 def compute_cohesion_prior(cands: List[Dict[str, Any]]) -> List[float]:
@@ -143,7 +138,7 @@ def apply_redundancy_penalty(cands: List[Dict[str, Any]], fused_scores: List[flo
     for i, c in enumerate(cands):
         key = (c.get("doc_id"), c.get("dieu"), c.get("khoan"), c.get("diem"))
         if key in seen:
-            out[i] *= 0.85  # phạt nhẹ
+            out[i] *= 0.85
         else:
             seen.add(key)
     return out
@@ -202,9 +197,8 @@ def rerank_candidates(
 
     if backend == "cross_encoder":
         model_name = model_name or os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
-        ce = _get_ce_model(model_name, max_length=max_length)  # tải 1 lần
+        ce = _get_ce_model(model_name, max_length=max_length)
         ce_scores = ce.predict([[query, d] for d in docs_for_ce], convert_to_numpy=True).tolist()
-        # Ghi chú: với một số CE (MS MARCO) có thể cần sigmoid để đưa về [0,1]; ranking không bị ảnh hưởng. :contentReference[oaicite:4]{index=4}
     else:
         ce_scores = [0.0]*len(pool)
 

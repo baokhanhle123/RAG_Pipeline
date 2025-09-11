@@ -16,7 +16,7 @@ ENV:
 
   TOPK_RETRIEVE=20
   PREFER_MODALITY=auto       # auto|table|image|text|none
-  ONLY_MODALITY=0            # 1 = lọc chặt theo modality
+  ONLY_MODALITY=0            # 1 = lọc chặt theo modality (sử dụng where_document với tag [BẢNG]/[HÌNH])
   STRICT_TABLE_RETRIEVE=0    # 1 = nếu query là 'table' thì ép only_modality=True
 
   # Rerank
@@ -61,7 +61,7 @@ def truncate_tokens(s: str, max_tokens: int) -> str:
     return ENC.decode(ids[:max_tokens])
 
 # ====== OpenAI ======
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")   # OpenAI Embeddings v3 small. :contentReference[oaicite:6]{index=6}
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL  = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 
 def get_openai_client() -> OpenAI:
@@ -94,7 +94,13 @@ def infer_query_modality(query: str) -> Optional[str]:
     if _IMAGE_PAT.search(query or ""): return "image"
     return None
 
-# ====== Retrieve (ưu tiên modality cho bảng/hình khi only_modality=True) ======
+def _infer_modality_from_text(txt: str) -> str:
+    t = (txt or "").lstrip()
+    if t.startswith("[BẢNG]"): return "table"
+    if t.startswith("[HÌNH]"): return "image"
+    return "text"
+
+# ====== Retrieve (ưu tiên modality bằng where_document khi only_modality=True) ======
 def retrieve(
     query: str,
     collection_name: str,
@@ -108,14 +114,17 @@ def retrieve(
 
     where = None
     where_document = None
-    if prefer_modality in {"table", "image", "text"} and only_modality:
-        # Lọc chặt theo modality qua metadata; có thể bổ sung where_document theo tag tiền xử lý
-        where = {"modality": {"$eq": prefer_modality}}
+    # Dùng where_document $contains để lọc theo nội dung (tag [BẢNG]/[HÌNH])
+    # Tài liệu Chroma: where_document/$contains dùng để lọc theo nội dung document. 
+    # (Phù hợp vì metadata.modality có thể không tồn tại trong pipeline).  # docs: see citations
+    if prefer_modality in {"table", "image"} and only_modality:
         if prefer_modality == "table":
             where_document = {"$contains": "[BẢNG]"}
         elif prefer_modality == "image":
             where_document = {"$contains": "[HÌNH]"}
-    # Tham chiếu Chroma filters: where / where_document. :contentReference[oaicite:7]{index=7}
+    elif prefer_modality == "text" and only_modality:
+        # Không lọc gì thêm; để all rồi rerank
+        where_document = None
 
     res = col.query(
         query_embeddings=[qvec],
@@ -132,11 +141,16 @@ def retrieve(
     dists_ = res.get("distances", [[]])[0] if res.get("distances") else []
 
     for i in range(max(len(ids_), len(docs_), len(metas_), len(dists_))):
+        doc_text = docs_[i] if i < len(docs_) else ""
         m = metas_[i] if i < len(metas_) else {}
+        modality = (m or {}).get("modality")
+        if not modality:
+            modality = _infer_modality_from_text(doc_text)
+
         item = {
             "id": ids_[i] if i < len(ids_) else None,
             "distance": dists_[i] if i < len(dists_) else None,
-            "text": docs_[i] if i < len(docs_) else "",
+            "text": doc_text,
             "citation": (m or {}).get("citation") or "",
             "doc_id": (m or {}).get("doc_id") or "",
             "van_ban": (m or {}).get("van_ban") or "",
@@ -146,11 +160,11 @@ def retrieve(
             "page_start": (m or {}).get("page_start"),
             "page_end": (m or {}).get("page_end"),
             "source_sha1": (m or {}).get("source_sha1"),
-            "modality": (m or {}).get("modality"),
+            "modality": modality,
             "has_table_html": (m or {}).get("has_table_html"),
             "table_html_excerpt": (m or {}).get("table_html_excerpt"),
             "has_image": (m or {}).get("has_image"),
-            # recency keys (nếu có) sẽ được dùng ở reranker:
+            # recency keys:
             "effective_date": (m or {}).get("effective_date") or (m or {}).get("ngay_hieu_luc"),
             "ban_hanh_date": (m or {}).get("ban_hanh_date") or (m or {}).get("ngay_ban_hanh"),
             "updated_at": (m or {}).get("updated_at"),
@@ -158,15 +172,13 @@ def retrieve(
         out.append(item)
     return {"query": query, "top_k": top_k, "results": out}
 
-# ====== Reranking — dùng module riêng (cross-encoder + priors) ======
-from rerankers import rerank_candidates, infer_query_modality as rr_infer_modality  # local module
-# Tham chiếu CE usage & BGE reranker. :contentReference[oaicite:8]{index=8}
+# ====== Reranking — module riêng ======
+from rerankers import rerank_candidates, infer_query_modality as rr_infer_modality
 
 # ====== Utilities: render bảng ======
 _HTML_TAG = re.compile(r"<[^>]+>")
 
 def is_markdown_table(text: str) -> bool:
-    """Heuristic nhận diện bảng Markdown."""
     if not text: return False
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) < 2: return False
@@ -175,7 +187,6 @@ def is_markdown_table(text: str) -> bool:
     return has_bar and has_sep
 
 def extract_markdown_table_from_text(text: str) -> Optional[str]:
-    """Trích khối bảng Markdown đầu tiên từ text (bỏ tiền tố [BẢNG] nếu có)."""
     if not text: return None
     t = text.lstrip()
     if t.startswith("[BẢNG]"): t = t[len("[BẢNG]"):].lstrip()
@@ -199,7 +210,6 @@ def extract_markdown_table_from_text(text: str) -> Optional[str]:
     return md if is_markdown_table(md) else None
 
 def truncate_markdown_table(md: str, max_rows: int = 30) -> str:
-    """Giữ header + separator + N dòng body."""
     lines = [ln for ln in md.splitlines()]
     if len(lines) <= 2: return md
     sep_idx = -1
@@ -243,7 +253,6 @@ def pick_table_blocks_from_ranked(
     max_rows: int,
     max_chars: int
 ) -> List[Tuple[str, str]]:
-    """Trả về list (table_markdown, source_label) lấy từ ranked (ưu tiên modality=table)."""
     out: List[Tuple[str,str]] = []
     for item in ranked:
         if len(out) >= max_tables: break
@@ -255,9 +264,8 @@ def pick_table_blocks_from_ranked(
             if isinstance(html_ex, list) and html_ex:
                 html_ex = html_ex[0]
             if isinstance(html_ex, str) and html_ex.strip():
-                # giữ nguyên HTML ở code block; LLM sẽ chuyển sang Markdown theo hướng dẫn prompt
                 md = "```html\n" + html_ex.strip() + "\n```"
-        if not md: 
+        if not md:
             continue
         md = truncate_markdown_table(md, max_rows=max_rows)
         if max_chars and len(md) > max_chars:
@@ -286,16 +294,14 @@ def make_system_prompt(is_table_query: bool) -> str:
             "sau đó tóm lược điểm chính và nêu căn cứ (điều/khoản/điểm, trang). Nếu context chứa HTML bảng trong "
             "khối ```html```, hãy chuyển hóa sang bảng Markdown trước khi trả lời.\n"
         )
-    return base  # RAG prompting guideline: “use only provided context / refuse otherwise”. :contentReference[oaicite:9]{index=9}
+    return base
 
 def make_user_prompt(query: str, contexts: List[str], sources: List[str], table_blocks: List[Tuple[str,str]], is_table_query: bool) -> List[Dict[str,str]]:
-    # Đánh số context để map [n]
     ctx_blocks = []
     for i, (ctx, src) in enumerate(zip(contexts, sources), 1):
         ctx_blocks.append(f"[{i}] SOURCE: {src}\nEXCERPT:\n{ctx}")
     ctx_text = "\n\n".join(ctx_blocks)
 
-    # Bảng (nếu có)
     tbl_text = ""
     if is_table_query and table_blocks:
         tbl_lines = []
@@ -325,7 +331,7 @@ def answer_with_llm(query: str, ranked: List[Dict[str,Any]]) -> Dict[str,Any]:
     contexts = [(x.get("text") or "").strip() for x in ranked]
     sources  = render_sources(ranked)
 
-    is_table_query = (infer_query_modality(query) == "table") or any((x.get("modality")=="table") for x in ranked[:2])
+    is_table_query = (infer_query_modality(query) == "table") or any(((x.get("modality") or "")=="table") for x in ranked[:2])
     max_rows  = int(os.getenv("TABLE_RENDER_MAX_ROWS", "30"))
     max_tabs  = int(os.getenv("TABLE_RENDER_MAX_TABLES", "2"))
     max_chars = int(os.getenv("TABLE_RENDER_MAX_CHARS", "12000"))
@@ -359,7 +365,7 @@ def answer_question(query: str, collection: str = COLLECTION, top_k_retrieve: Op
         else:
             prefer_modality = None
 
-    # Nếu câu hỏi là bảng và STRICT_TABLE_RETRIEVE=1 → lọc chặt theo modality=table
+    # STRICT_TABLE_RETRIEVE
     if only_modality is None:
         if (prefer_modality == "table") and (os.getenv("STRICT_TABLE_RETRIEVE","0") == "1"):
             only_modality = True
@@ -406,13 +412,13 @@ def main():
     args = p.parse_args()
 
     q = args.query.strip()
-    q = "Quy định kỹ thuật về Máy bơm chữa cháy"
+    q = "Luật PCCC và CNCH số 55/2024/QH15 được Quốc hội thông qua ngày 29/11/2024, có hiệu lực thi hành từ ngày 01/7/2025, gồm bao nhiêu Chương, Điều"
     if not q:
         print("Vui lòng cung cấp --query hoặc đặt DEMO_QUERY.")
         return
     res = answer_question(q, collection=args.collection, top_k_retrieve=args.top_k, prefer_modality=args.prefer_modality)
     print("\n--- ANSWER ---\n", res["answer"])
-    if res["sources"]:
+    if res["sources"] and isinstance(res["sources"], list):
         print("\n--- SOURCES ---")
         for i, s in enumerate(res["sources"], 1):
             print(f"[{i}] {s}")
