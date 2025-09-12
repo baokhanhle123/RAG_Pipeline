@@ -2,43 +2,60 @@
 # -*- coding: utf-8 -*-
 
 """
-Preprocess PCCC docs:
-- DOC/DOCX/PDF: Unstructured API (PDF có thể chunk).
-- PPT/PPTX: xử lý CỤC BỘ bằng python-pptx (KHÔNG dùng Unstructured API).
-- Ghi JSONL: mỗi element có text + metadata (không chứa None), giữ số trang/slide tuyệt đối.
+Preprocess PCCC legal docs (DOC/DOCX/PDF via Unstructured API; PPT/PPTX offline)
+- Append to JSONL (skip duplicates by SHA1)
+- Split large PDFs by page ranges
+- Preserve absolute page/slide numbers
+- NEW: For PPT/PPTX, parse locally using python-pptx (no Unstructured API)
+- NEW: Uniform top-level identifiers for Parent-Doc retriever:
+       source_sha1, source_name, source_path, source_ext, doc_id
+
+Env:
+  UNSTRUCTURED_API_URL   (default: https://api.unstructuredapp.io/general/v0/general)
+  UNSTRUCTURED_API_KEY   (required for DOC/DOCX/PDF only)
 """
 
 from __future__ import annotations
-import argparse, hashlib, io, json, mimetypes, os, sys, time
+import argparse
+import hashlib
+import io
+import json
+import mimetypes
+import os
 from pathlib import Path
+import sys
+import time
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# -------- Optional deps --------
+# Local PPTX
+try:
+    from pptx import Presentation  # pip install python-pptx
+except Exception:
+    Presentation = None
+
+# Optional streaming multipart
 try:
     from requests_toolbelt.multipart.encoder import MultipartEncoder
 except Exception:
     MultipartEncoder = None
 
+# Optional PDF split
 try:
     from pypdf import PdfReader, PdfWriter
 except Exception:
-    PdfReader = None  # type: ignore
-    PdfWriter = None  # type: ignore
-
-# python-pptx (local PPTX parsing)
-try:
-    from pptx import Presentation
-    from pptx.enum.shapes import MSO_SHAPE_TYPE  # Hình ảnh, v.v. :contentReference[oaicite:6]{index=6}
-    PPTX_AVAILABLE = True
-except Exception:
-    PPTX_AVAILABLE = False
+    PdfReader = None
+    PdfWriter = None
 
 # ----------------- Config -----------------
-SUPPORTED_EXTS = {".doc", ".docx", ".pdf", ".ppt", ".pptx", ".pptm", ".pot", ".potx"}
+SUPPORTED_EXTS = {
+    ".doc", ".docx",
+    ".pdf",
+    ".ppt", ".pptx", ".pptm", ".pot", ".potx",
+}
 PPT_EXTS = {".ppt", ".pptx", ".pptm", ".pot", ".potx"}
 
 DEFAULT_API_URL = os.environ.get("UNSTRUCTURED_API_URL", "https://api.unstructuredapp.io/general/v0/general")
@@ -57,32 +74,45 @@ PDF_PARAMS = {
     "strategy": "hi_res",
     "coordinates": "true",
     "include_page_breaks": "true",
-    "pdf_infer_table_structure": "true",  # HTML bảng cho PDF khi hi_res  :contentReference[oaicite:7]{index=7}
+    "pdf_infer_table_structure": "true",
     "languages": "vie",
 }
-GENERIC_PARAMS = {"strategy": "auto", "include_page_breaks": "true", "languages": "vie"}
+GENERIC_PARAMS = {
+    "strategy": "auto",
+    "include_page_breaks": "true",
+    "languages": "vie",
+}
 
 # ----------------- Helpers -----------------
-def sha1_of_file(path: Path, chunk: int = 1 << 20) -> str:
+def sha1_of_file(path: Path, chunk: int = 1024 * 1024) -> str:
     h = hashlib.sha1()
     with path.open("rb") as f:
         while True:
             b = f.read(chunk)
-            if not b: break
+            if not b:
+                break
             h.update(b)
     return h.hexdigest()
 
 def load_existing_hashes(jsonl_path: Path) -> set:
     seen = set()
-    if not jsonl_path.exists(): return seen
+    if not jsonl_path.exists():
+        return seen
     with jsonl_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line: continue
-            try: obj = json.loads(line)
-            except Exception: continue
-            fs = (obj.get("metadata") or {}).get("file_sha1")
-            if fs: seen.add(fs)
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            # accept both keys
+            top = obj
+            meta = obj.get("metadata") or {}
+            fs = top.get("source_sha1") or meta.get("file_sha1")
+            if fs:
+                seen.add(fs)
     return seen
 
 def detect_mime(path: Path) -> str:
@@ -90,22 +120,25 @@ def detect_mime(path: Path) -> str:
     return mime or "application/octet-stream"
 
 def build_partition_params_for(path: Path) -> Dict[str, str]:
-    return dict(PDF_PARAMS if path.suffix.lower() == ".pdf" else GENERIC_PARAMS)
+    return dict(PDF_PARAMS if path.suffix.lower()==".pdf" else GENERIC_PARAMS)
 
 def chunk_pdf_bytes(source_pdf: Path, max_pages: int) -> Iterable[Tuple[bytes, int, int]]:
     if PdfReader is None:
-        yield (source_pdf.read_bytes(), 1, -1); return
+        yield (source_pdf.read_bytes(), 1, -1)
+        return
     reader = PdfReader(str(source_pdf))
     total = len(reader.pages)
     if total <= max_pages:
-        yield (source_pdf.read_bytes(), 1, total); return
+        yield (source_pdf.read_bytes(), 1, total)
+        return
     start = 1
     while start <= total:
         end = min(start + max_pages - 1, total)
         writer = PdfWriter()
         for p in range(start - 1, end):
             writer.add_page(reader.pages[p])
-        buf = io.BytesIO(); writer.write(buf)
+        buf = io.BytesIO()
+        writer.write(buf)
         yield (buf.getvalue(), start, end)
         start = end + 1
 
@@ -120,12 +153,13 @@ def _compute_upload_timeouts(file_size_bytes: int) -> Tuple[float, float]:
 
 def _make_session() -> requests.Session:
     s = requests.Session()
-    retries = Retry(total=0, connect=0, read=0, backoff_factor=0, status_forcelist=[],
-                    allowed_methods=frozenset(["POST"]), raise_on_status=False)
+    retries = Retry(total=0, connect=0, read=0, backoff_factor=0, status_forcelist=[], allowed_methods=frozenset(["POST"]), raise_on_status=False)
     adapter = HTTPAdapter(max_retries=retries, pool_connections=4, pool_maxsize=4)
-    s.mount("https://", adapter); s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     return s
 
+# ----------- Unstructured API posting (DOC/DOCX/PDF only) -----------
 def _post_to_unstructured_bytes(file_bytes: bytes, filename: str, extra_params: Dict[str, str],
                                 timeout_pair: Tuple[float, float], max_retries: int = 4) -> List[dict]:
     if not API_KEY:
@@ -138,249 +172,273 @@ def _post_to_unstructured_bytes(file_bytes: bytes, filename: str, extra_params: 
         try:
             files = {"files": (filename, io.BytesIO(file_bytes), detect_mime(Path(filename)))}
             resp = sess.post(url, headers=headers, files=files, data=extra_params, timeout=timeout_pair)
-            if resp.status_code in (200, 201): return resp.json()
+            if resp.status_code in (200, 201):
+                return resp.json()
             if resp.status_code >= 500 or resp.status_code in (408, 429):
-                last_err = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}"); time.sleep(min(2**attempt, 10)); continue
+                last_err = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+                time.sleep(min(2 ** attempt, 10))
+                continue
             resp.raise_for_status()
         except Exception as e:
-            last_err = e; time.sleep(min(2**attempt, 10)); continue
+            last_err = e
+            time.sleep(min(2 ** attempt, 10))
     raise RuntimeError(f"Failed to call Unstructured API after {max_retries} attempts: {last_err}")
 
-# ----------------- PPTX local parsing -----------------
-# Tài liệu: has_text_frame / paragraphs / runs, has_table, MSO_SHAPE_TYPE.PICTURE :contentReference[oaicite:8]{index=8}
-EMU_PER_INCH = 914400
-def _emu_to_px(emu: int, dpi: int = 96) -> int:
-    return int(round((emu / EMU_PER_INCH) * dpi))
+def _post_to_unstructured_stream(path: Path, extra_params: Dict[str, str],
+                                 timeout_pair: Tuple[float, float], max_retries: int = 4) -> List[dict]:
+    if not API_KEY:
+        raise RuntimeError("UNSTRUCTURED_API_KEY is not set.")
+    url = DEFAULT_API_URL
+    last_err = None
+    sess = _make_session()
+    headers = {"accept": "application/json", "unstructured-api-key": API_KEY}
+    for attempt in range(1, max_retries + 1):
+        try:
+            if MultipartEncoder is not None:
+                f = path.open("rb")
+                try:
+                    fields = dict(extra_params)
+                    fields["files"] = (path.name, f, detect_mime(path))
+                    enc = MultipartEncoder(fields=fields)
+                    headers["Content-Type"] = enc.content_type
+                    resp = sess.post(url, headers=headers, data=enc, timeout=timeout_pair)
+                finally:
+                    try: f.close()
+                    except Exception: pass
+            else:
+                with path.open("rb") as f:
+                    files = {"files": (path.name, f, detect_mime(path))}
+                    resp = sess.post(url, headers=headers, files=files, data=extra_params, timeout=timeout_pair)
+            if resp.status_code in (200, 201):
+                return resp.json()
+            if resp.status_code >= 500 or resp.status_code in (408, 429):
+                last_err = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+                time.sleep(min(2 ** attempt, 10))
+                continue
+            resp.raise_for_status()
+        except Exception as e:
+            last_err = e
+            time.sleep(min(2 ** attempt, 10))
+            continue
+    raise RuntimeError(f"Failed to call Unstructured API after {max_retries} attempts: {last_err}")
 
-def _clean(s: Optional[str]) -> str:
-    return " ".join(str(s or "").split())
+# ----------- Normalization -----------
+def _add_source_top_level(obj: dict, *, file_sha1: str, file_path: Path) -> dict:
+    """Ensure unified top-level identifiers for downstream Parent-Doc logic."""
+    obj["source_sha1"] = file_sha1
+    obj["source_name"] = file_path.name
+    obj["source_path"] = str(file_path)
+    obj["source_ext"]  = file_path.suffix.lower()
+    # doc_id: use stem; can be replaced later after title-extraction
+    obj["doc_id"] = file_path.stem
+    return obj
 
-def _para_to_text(paragraph) -> str:
-    runs = [r.text for r in paragraph.runs if r.text]
-    return _clean("".join(runs)) or _clean(paragraph.text)
-
-def _shape_coordinates(shape) -> Optional[dict]:
-    try:
-        return {
-            "left_px": _emu_to_px(int(shape.left)),
-            "top_px": _emu_to_px(int(shape.top)),
-            "width_px": _emu_to_px(int(shape.width)),
-            "height_px": _emu_to_px(int(shape.height)),
-            "units": "px@96dpi",
-        }
-    except Exception:
-        return None
-
-def _table_to_markdown(table) -> str:
-    rows = table.rows
-    if len(rows) == 0: return ""
-    def cell_text(cell): return _clean(getattr(cell, "text", "") or "")
-    header = [cell_text(c) for c in rows[0].cells]
-    md = []
-    md.append("| " + " | ".join(header) + " |")
-    md.append("| " + " | ".join(["---" for _ in header]) + " |")
-    for r in rows[1:]:
-        md.append("| " + " | ".join([cell_text(c) for c in r.cells]) + " |")
-    return "\n".join(md)
-
-def _table_to_html(table) -> str:
-    rows = table.rows
-    if len(rows) == 0: return ""
-    def cell_text(cell): return _clean(getattr(cell, "text", "") or "")
-    html = ["<table>"]
-    for ir, r in enumerate(rows):
-        html.append("<tr>")
-        tag = "th" if ir == 0 else "td"
-        for c in r.cells: html.append(f"<{tag}>{cell_text(c)}</{tag}>")
-        html.append("</tr>")
-    html.append("</table>")
-    return "".join(html)
-
-def parse_pptx_locally(path: Path) -> List[dict]:
-    if not PPTX_AVAILABLE:
-        raise RuntimeError("python-pptx is not installed. pip install python-pptx")
-    prs = Presentation(str(path))
-    slide_w, slide_h = int(prs.slide_width), int(prs.slide_height)
-
-    elements: List[dict] = []
-    for idx, slide in enumerate(prs.slides, start=1):
-        for shape in slide.shapes:
-            try:
-                # TABLE
-                if getattr(shape, "has_table", False):
-                    table = shape.table
-                    md = _table_to_markdown(table)
-                    html = _table_to_html(table)
-                    text = ("[BẢNG]\n" + md) if md else "[BẢNG]"
-                    meta = {
-                        "file_name": path.name, "file_path": str(path), "mime_type": detect_mime(path),
-                        "page_number": idx, "abs_page_number": idx, "slide_number": idx,
-                        "has_table_html": True, "table_html_excerpt": html,
-                        "coordinates": _shape_coordinates(shape),
-                        "slide_size_px": {"width_px": _emu_to_px(slide_w), "height_px": _emu_to_px(slide_h)},
-                    }
-                    elements.append({
-                        "element_id": f"pptx-{idx}-table-{len(elements)+1}",
-                        "type": "Table",
-                        "text": text,
-                        "metadata": {k: v for k, v in meta.items() if v is not None},
-                    })
-                    continue
-
-                # TEXT (title / bullets / narrative)
-                if getattr(shape, "has_text_frame", False):
-                    for para in shape.text_frame.paragraphs:
-                        txt = _para_to_text(para)
-                        if not txt: continue
-                        lvl = getattr(para, "level", 0) or 0
-                        is_bullet = getattr(para, "bullet", None)
-                        if is_bullet:
-                            md_text = ("  " * lvl) + "- " + txt
-                            el_type = "ListItem"
-                        else:
-                            el_type = "NarrativeText"
-                            md_text = txt
-                        meta = {
-                            "file_name": path.name, "file_path": str(path), "mime_type": detect_mime(path),
-                            "page_number": idx, "abs_page_number": idx, "slide_number": idx,
-                            "coordinates": _shape_coordinates(shape),
-                            "slide_size_px": {"width_px": _emu_to_px(slide_w), "height_px": _emu_to_px(slide_h)},
-                        }
-                        elements.append({
-                            "element_id": f"pptx-{idx}-text-{len(elements)+1}",
-                            "type": el_type,
-                            "text": md_text,
-                            "metadata": {k: v for k, v in meta.items() if v is not None},
-                        })
-                    continue
-
-                # IMAGE
-                if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.PICTURE:
-                    meta = {
-                        "file_name": path.name, "file_path": str(path), "mime_type": detect_mime(path),
-                        "page_number": idx, "abs_page_number": idx, "slide_number": idx,
-                        "has_image": True, "coordinates": _shape_coordinates(shape),
-                        "slide_size_px": {"width_px": _emu_to_px(slide_w), "height_px": _emu_to_px(slide_h)},
-                    }
-                    elements.append({
-                        "element_id": f"pptx-{idx}-image-{len(elements)+1}",
-                        "type": "Figure",
-                        "text": "[HÌNH]",
-                        "metadata": {k: v for k, v in meta.items() if v is not None},
-                    })
-                    continue
-
-            except Exception as e:
-                sys.stderr.write(f"[WARN] slide {idx}: skip shape due to {e}\n")
-
-        # Page break marker (tuỳ chọn)
-        elements.append({
-            "element_id": f"pptx-{idx}-pagebreak",
-            "type": "PageBreak",
-            "text": "",
-            "metadata": {"page_number": idx, "abs_page_number": idx, "slide_number": idx,
-                         "file_name": path.name, "file_path": str(path)},
-        })
-
-    return elements
-
-# ----------------- Normalize (dùng chung) -----------------
 def _normalize_element(e: dict, *, file_sha1: str, file_path: Path, abs_page_offset: int = 0) -> dict:
     meta = e.get("metadata") or {}
     page_no = meta.get("page_number")
-    abs_page = (page_no + max(abs_page_offset, 0)) if isinstance(page_no, int) else meta.get("abs_page_number")
+    abs_page = None
+    if isinstance(page_no, int):
+        abs_page = page_no + max(abs_page_offset, 0)
+    languages = meta.get("languages") or meta.get("language") or None
+
     normalized = {
-        "element_id": e.get("element_id"),
+        "element_id": e.get("element_id") or e.get("id"),
         "type": e.get("type"),
         "text": e.get("text"),
         "metadata": {
-            "file_name": meta.get("file_name", file_path.name),
-            "file_path": meta.get("file_path", str(file_path)),
+            "file_name": file_path.name,
+            "file_path": str(file_path),
             "file_sha1": file_sha1,
-            "source": meta.get("source", "pptx_local" if file_path.suffix.lower() in PPT_EXTS else "unstructured_api"),
-            "mime_type": meta.get("mime_type", detect_mime(file_path)),
-            "page_number": meta.get("page_number"),
+            "source": "unstructured_api",
+            "mime_type": detect_mime(file_path),
+            "page_number": page_no,
             "abs_page_number": abs_page,
-            "slide_number": meta.get("slide_number"),
-            "languages": meta.get("languages"),
+            "slide_number": page_no if file_path.suffix.lower() in PPT_EXTS else None,
+            "languages": languages,
             "coordinates": meta.get("coordinates"),
             "text_as_html": meta.get("text_as_html"),
-            "has_table_html": meta.get("has_table_html"),
-            "table_html_excerpt": meta.get("table_html_excerpt"),
-            "has_image": meta.get("has_image"),
-            "slide_size_px": meta.get("slide_size_px"),
             "parent_id": meta.get("parent_id"),
             "section": meta.get("section"),
             "category_depth": meta.get("category_depth"),
         },
     }
     normalized["metadata"] = {k: v for k, v in normalized["metadata"].items() if v is not None}
-    return normalized
+    return _add_source_top_level(normalized, file_sha1=file_sha1, file_path=file_path)
+
+# ----------- PPTX offline parsing -----------
+def _pptx_extract_markdown_table(tbl) -> str:
+    # Very simple conversion: first row -> header; others -> body
+    rows = []
+    for r in tbl.rows:
+        row = []
+        for c in r.cells:
+            txt = (c.text or "").strip().replace("\n", " ")
+            rows.append(None) if False else None  # placeholder
+            row.append(txt)
+        rows.append("| " + " | ".join([x or "" for x in row]) + " |")
+    if not rows:
+        return ""
+    # build header separator from header length
+    first = rows[0]
+    ncol = first.count("|") - 1 if first else 0
+    if ncol <= 0:
+        return "\n".join(rows)
+    sep = "|" + "|".join([" --- "]*ncol) + "|"
+    return "\n".join([rows[0], sep] + rows[1:])
+
+def _pptx_process(path: Path, file_sha1: str) -> List[dict]:
+    if Presentation is None:
+        raise RuntimeError("python-pptx is not installed, cannot process PPT/PPTX offline.")
+    prs = Presentation(str(path))
+    out: List[dict] = []
+    for s_idx, slide in enumerate(prs.slides, start=1):
+        # Title (if any)
+        title_txt = ""
+        if slide.shapes.title:
+            title_txt = (slide.shapes.title.text or "").strip()
+            if title_txt:
+                out.append(_add_source_top_level({
+                    "element_id": f"{file_sha1}-slide{s_idx}-title",
+                    "type": "Title",
+                    "text": title_txt,
+                    "metadata": {
+                        "file_name": path.name,
+                        "file_path": str(path),
+                        "file_sha1": file_sha1,
+                        "source": "pptx_local",
+                        "mime_type": detect_mime(path),
+                        "page_number": s_idx,
+                        "slide_number": s_idx,
+                        "languages": "vie",
+                    },
+                }, file_sha1=file_sha1, file_path=path))
+
+        # Other shapes
+        for shp_i, shp in enumerate(slide.shapes, start=1):
+            try:
+                if getattr(shp, "has_text_frame", False) and shp.text_frame and shp.text:
+                    txt = (shp.text or "").strip()
+                    if txt and txt != title_txt:
+                        out.append(_add_source_top_level({
+                            "element_id": f"{file_sha1}-slide{s_idx}-shape{shp_i}-p",
+                            "type": "NarrativeText",
+                            "text": txt,
+                            "metadata": {
+                                "file_name": path.name,
+                                "file_path": str(path),
+                                "file_sha1": file_sha1,
+                                "source": "pptx_local",
+                                "mime_type": detect_mime(path),
+                                "page_number": s_idx,
+                                "slide_number": s_idx,
+                                "languages": "vie",
+                            },
+                        }, file_sha1=file_sha1, file_path=path))
+                if getattr(shp, "has_table", False) and shp.table:
+                    md = _pptx_extract_markdown_table(shp.table)
+                    if md.strip():
+                        out.append(_add_source_top_level({
+                            "element_id": f"{file_sha1}-slide{s_idx}-shape{shp_i}-tbl",
+                            "type": "Table",
+                            "text": "[BẢNG]\n" + md,
+                            "metadata": {
+                                "file_name": path.name,
+                                "file_path": str(path),
+                                "file_sha1": file_sha1,
+                                "source": "pptx_local",
+                                "mime_type": detect_mime(path),
+                                "page_number": s_idx,
+                                "slide_number": s_idx,
+                                "languages": "vie",
+                                # keep a tiny HTML-ish echo for later if needed
+                                "text_as_html": None,
+                            },
+                        }, file_sha1=file_sha1, file_path=path))
+                if getattr(shp, "shape_type", None) and str(getattr(shp, "shape_type")).lower().find("picture") >= 0:
+                    # Picture placeholder (no caption extraction here)
+                    out.append(_add_source_top_level({
+                        "element_id": f"{file_sha1}-slide{s_idx}-shape{shp_i}-img",
+                        "type": "Image",
+                        "text": "[HÌNH] Ảnh/biểu đồ trên slide",
+                        "metadata": {
+                            "file_name": path.name,
+                            "file_path": str(path),
+                            "file_sha1": file_sha1,
+                            "source": "pptx_local",
+                            "mime_type": detect_mime(path),
+                            "page_number": s_idx,
+                            "slide_number": s_idx,
+                            "languages": "vie",
+                        },
+                    }, file_sha1=file_sha1, file_path=path))
+            except Exception:
+                continue
+    return out
 
 # ----------------- Core -----------------
-def _post_doc_or_pdf(path: Path, out_jsonl: Path, max_pdf_pages_per_chunk: int) -> int:
-    """DOC/DOCX/PDF → Unstructured API; PDF có thể chunk."""
+def preprocess_file(path: Path, out_jsonl: Path, max_pdf_pages_per_chunk: int) -> int:
+    suffix = path.suffix.lower()
+    if suffix not in SUPPORTED_EXTS:
+        return 0
     file_sha1 = sha1_of_file(path)
+    lines_written = 0
     file_size = path.stat().st_size
     timeout_pair = _compute_upload_timeouts(file_size)
-    params = build_partition_params_for(path)
-    written = 0
 
-    if path.suffix.lower() == ".pdf":
+    if suffix == ".pdf":
         for chunk_bytes, start_idx, end_idx in chunk_pdf_bytes(path, max_pages=max_pdf_pages_per_chunk):
+            params = build_partition_params_for(path)
             resp_json = _post_to_unstructured_bytes(chunk_bytes, path.name, params, timeout_pair=timeout_pair)
             offset = max(start_idx - 1, 0) if end_idx != -1 else 0
             with out_jsonl.open("a", encoding="utf-8") as out:
                 for el in resp_json:
                     norm = _normalize_element(el, file_sha1=file_sha1, file_path=path, abs_page_offset=offset)
                     out.write(json.dumps(norm, ensure_ascii=False) + "\n")
-                    written += 1
-    else:
+                    lines_written += 1
+    elif suffix in {".doc", ".docx"}:
+        params = build_partition_params_for(path)
         file_bytes = path.read_bytes()
         resp_json = _post_to_unstructured_bytes(file_bytes, path.name, params, timeout_pair=timeout_pair)
         with out_jsonl.open("a", encoding="utf-8") as out:
             for el in resp_json:
                 norm = _normalize_element(el, file_sha1=file_sha1, file_path=path, abs_page_offset=0)
                 out.write(json.dumps(norm, ensure_ascii=False) + "\n")
-                written += 1
-    return written
-
-def _post_ppt_or_pptx_locally(path: Path, out_jsonl: Path) -> int:
-    """PPT/PPTX → PARSE LOCAL (python-pptx), KHÔNG dùng Unstructured API."""
-    file_sha1 = sha1_of_file(path)
-    elements = parse_pptx_locally(path)
-    written = 0
-    with out_jsonl.open("a", encoding="utf-8") as out:
-        for el in elements:
-            norm = _normalize_element(el, file_sha1=file_sha1, file_path=path, abs_page_offset=0)
-            out.write(json.dumps(norm, ensure_ascii=False) + "\n")
-            written += 1
-    return written
-
-def preprocess_file(path: Path, out_jsonl: Path, max_pdf_pages_per_chunk: int) -> int:
-    if path.suffix.lower() not in SUPPORTED_EXTS: return 0
-    if path.suffix.lower() in PPT_EXTS:
-        # KHÔNG dùng Unstructured API cho PPT/PPTX
-        return _post_ppt_or_pptx_locally(path, out_jsonl)
+                lines_written += 1
+    elif suffix in PPT_EXTS:
+        # PPT/PPTX handled OFFLINE
+        try:
+            rows = _pptx_process(path, file_sha1=file_sha1)
+        except Exception as e:
+            print(f"⚠️  Failed PPT/PPTX local parse {path.name}: {e}", file=sys.stderr)
+            return 0
+        with out_jsonl.open("a", encoding="utf-8") as out:
+            for norm in rows:
+                out.write(json.dumps(norm, ensure_ascii=False) + "\n")
+                lines_written += 1
     else:
-        # DOC/DOCX/PDF vẫn đi qua API
-        return _post_doc_or_pdf(path, out_jsonl, max_pdf_pages_per_chunk)
+        return 0
+    return lines_written
 
 def preprocess_folder(data_dir: str, out_jsonl: str, max_pdf_pages_per_chunk: int) -> Tuple[int, int]:
-    data_path = Path(data_dir); out_path = Path(out_jsonl)
+    data_path = Path(data_dir)
+    out_path = Path(out_jsonl)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     existing_hashes = load_existing_hashes(out_path)
-    seen_files = new_files = 0
+
+    seen_files = 0
+    new_files = 0
     for p in sorted(data_path.rglob("*")):
         if not p.is_file(): continue
         if p.suffix.lower() not in SUPPORTED_EXTS: continue
         seen_files += 1
         fsha1 = sha1_of_file(p)
-        if fsha1 in existing_hashes: continue
+        if fsha1 in existing_hashes:
+            continue
         try:
-            written = preprocess_file(p, out_path, max_pdf_pages_per_chunk)
+            written = preprocess_file(p, out_path, max_pdf_pages_per_chunk=max_pdf_pages_per_chunk)
             if written > 0:
-                new_files += 1; existing_hashes.add(fsha1)
+                new_files += 1
+                existing_hashes.add(fsha1)
                 print(f"Appended {written} elements from: {p.name}")
         except Exception as e:
             print(f"⚠️  Failed {p.name}: {e}", file=sys.stderr)
@@ -392,13 +450,8 @@ def main():
     parser.add_argument("--data-dir", required=True, help="Folder with DOC/DOCX/PDF/PPT/PPTX")
     parser.add_argument("--out-jsonl", required=True, help="Output JSONL to append elements")
     parser.add_argument("--max-pdf-pages-per-chunk", type=int,
-                        default=int(os.environ.get("MAX_PDF_PAGES_PER_CHUNK", DEFAULT_MAX_PDF_PAGES_PER_CHUNK)),
-                        help=f"Max pages per PDF chunk (default {DEFAULT_MAX_PDF_PAGES_PER_CHUNK})")
+                        default=int(os.environ.get("MAX_PDF_PAGES_PER_CHUNK", DEFAULT_MAX_PDF_PAGES_PER_CHUNK)))
     args = parser.parse_args()
-
-    if not PPTX_AVAILABLE:
-        print("⚠️  python-pptx chưa được cài — cài: pip install python-pptx", file=sys.stderr)
-
     n_seen, n_new = preprocess_folder(args.data_dir, args.out_jsonl, max_pdf_pages_per_chunk=args.max_pdf_pages_per_chunk)
     print(f"✅ Scanned {n_seen} files, appended {n_new} new files to {args.out_jsonl}")
 

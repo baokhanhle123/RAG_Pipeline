@@ -131,12 +131,51 @@ def compute_cohesion_prior(cands: List[Dict[str, Any]]) -> List[float]:
         counts[v] = counts.get(v, 0) + 1
     return [ min(1.0, counts.get((c.get("van_ban") or "").strip(), 0) / 5.0) for c in cands ]
 
-# ===== Giảm trùng: penalize khi trùng (doc_id, dieu, khoan, diem) =====
+# ===== Prior 4: lexical prior từ BM25 (nếu có) =====
+def compute_lexical_prior(cands: List[Dict[str, Any]]) -> List[float]:
+    vals = [ (c.get("bm25") if c.get("bm25") is not None else 0.0) for c in cands ]
+    if not vals: return [0.0]*len(cands)
+    mn, mx = min(vals), max(vals)
+    if mx <= mn + 1e-12: return [1.0]*len(cands)
+    return [ (v - mn) / (mx - mn) for v in vals ]
+
+# ===== Prior 5: scope theo cùng 'ancestor_dieu_id' hoặc 'dieu' trong cùng 'doc_id' =====
+def compute_scope_prior(cands: List[Dict[str, Any]]) -> List[float]:
+    """
+    Boost các ứng viên cùng 'cha' pháp lý (Điều) trong cùng doc_id để tránh lẫn Khoản/Điểm sang điều khác.
+    """
+    def key(c):
+        # Ưu tiên ancestor_dieu_id (nếu đã được pipeline gắn), fallback theo 'dieu'
+        return (c.get("doc_id"), c.get("ancestor_dieu_id") or ("DIEU", c.get("dieu")))
+    counts = {}
+    for c in cands:
+        k = key(c)
+        counts[k] = counts.get(k, 0) + 1
+    mx = max(counts.values()) if counts else 1
+    return [ counts.get(key(c), 0) / float(mx) for c in cands ]
+
+# ===== Prior 6: money prior (nếu hỏi 'phạt bao nhiêu tiền' → ưu tiên chunk có số tiền) =====
+_MONEY_Q = re.compile(r"\b(phạt|mức phạt|bao nhiêu tiền|tiền phạt|xử phạt)\b", re.I | re.U)
+_MONEY_PAT = re.compile(r"(\d{1,3}(?:\.\d{3})+|\d+)\s*(đ|đồng|vnđ|vnd)\b", re.I | re.U)
+
+def compute_money_prior(query: str, cands: List[Dict[str, Any]]) -> List[float]:
+    if not _MONEY_Q.search(query or ""):
+        return [0.0]*len(cands)
+    vals = []
+    for c in cands:
+        txt = (c.get("text") or "").lower()
+        vals.append(1.0 if _MONEY_PAT.search(txt) else 0.0)
+    # không cần minmax; đã là 0/1
+    return vals
+
+# ===== Giảm trùng: penalize khi trùng (doc_id, ancestor_dieu_id/dieu, khoan, diem) =====
 def apply_redundancy_penalty(cands: List[Dict[str, Any]], fused_scores: List[float]) -> List[float]:
     seen = set()
     out = list(fused_scores)
     for i, c in enumerate(cands):
-        key = (c.get("doc_id"), c.get("dieu"), c.get("khoan"), c.get("diem"))
+        key = (c.get("doc_id"),
+               c.get("ancestor_dieu_id") or ("DIEU", c.get("dieu")),
+               c.get("khoan"), c.get("diem"))
         if key in seen:
             out[i] *= 0.85
         else:
@@ -191,9 +230,12 @@ def rerank_candidates(
 
     docs_for_ce = [ make_rerank_text(c) for c in pool ]
     vec_sims = normalize_distance_to_similarity([ c.get("distance") for c in pool ])
-    pri_mod = compute_modality_prior(query, pool, user_prefer_modality=prefer_modality)
-    pri_rec = compute_recency_prior(pool)
-    pri_coh = compute_cohesion_prior(pool)
+    pri_mod  = compute_modality_prior(query, pool, user_prefer_modality=prefer_modality)
+    pri_rec  = compute_recency_prior(pool)
+    pri_coh  = compute_cohesion_prior(pool)
+    pri_lex  = compute_lexical_prior(pool)
+    pri_scope= compute_scope_prior(pool)
+    pri_money= compute_money_prior(query, pool)
 
     if backend == "cross_encoder":
         model_name = model_name or os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
@@ -204,14 +246,28 @@ def rerank_candidates(
 
     w_ce, w_vec, w_mod, w_rec, w_coh = weights
     fused = fuse_scores(ce_scores, vec_sims, pri_mod, pri_rec, pri_coh, w_ce, w_vec, w_mod, w_rec, w_coh)
+
+    # Thêm trọng số mở rộng (lexical/scope/money) — tương thích ngược qua env
+    w_lex   = float(os.getenv("W_LEX",   "0.06"))
+    w_scope = float(os.getenv("W_SCOPE", "0.06"))
+    w_money = float(os.getenv("W_MONEY", "0.04"))
+
+    lex_n   = _minmax(pri_lex)
+    scope_n = _minmax(pri_scope)
+    money_n = _minmax(pri_money)
+
+    fused = [ fused[i] + w_lex*lex_n[i] + w_scope*scope_n[i] + w_money*money_n[i] for i in range(len(fused)) ]
     fused = apply_redundancy_penalty(pool, fused)
 
     for i, c in enumerate(pool):
         c["score_ce"] = ce_scores[i]
         c["score_vec"] = vec_sims[i]
         c["score_prior_modality"] = pri_mod[i]
-        c["score_prior_recency"] = pri_rec[i]
+        c["score_prior_recency"]  = pri_rec[i]
         c["score_prior_cohesion"] = pri_coh[i]
+        c["score_prior_lexical"]  = pri_lex[i]
+        c["score_prior_scope"]    = pri_scope[i]
+        c["score_prior_money"]    = pri_money[i]
         c["score_rerank"] = fused[i]
 
     pool.sort(key=lambda x: x["score_rerank"], reverse=True)

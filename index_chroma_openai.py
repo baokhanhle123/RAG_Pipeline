@@ -2,27 +2,55 @@
 # -*- coding: utf-8 -*-
 
 """
-Index incremental chunks (DOC/DOCX/PDF) vào Chroma bằng OpenAI Embeddings.
-- Batching theo ngân sách token + fallback chia đôi khi dính 'max_tokens_per_request'.
-- Retry/backoff khi gặp RateLimit/Timeout/5xx.
-- Tự gán metadata 'modality' (table/image/text) + (tùy chọn) collection phụ cho TABLE/IMAGE (tái dùng vector).
-- Kiểm tra 'citation' để đảm bảo trích dẫn chuẩn từ smart chunking.
+Index incremental chunks (DOC/DOCX/PDF/PPTX) vào Chroma bằng OpenAI Embeddings
++ XÂY DỰNG CHỈ MỤC LEXICAL (FTS5) để hỗ trợ Hybrid search (BM25 + dense).
 
-Tham khảo:
-- Chroma where / where_document filter khi truy vấn.  # docs.trychroma.com
-- New OpenAI embeddings (text-embedding-3-small/large). # openai.com blog
+Tính năng:
+- Batching theo ngân sách token + fallback chia đôi khi dính 'max_tokens_per_request'.
+- Retry/backoff cho RateLimit/Timeout/5xx.
+- Sanitize metadata an toàn cho Chroma (str/int/float/bool; list/dict -> JSON).
+- Phát hiện modality (table/image/text) & upsert song song (tuỳ chọn) collection phụ.
+- Xây FTS5 (SQLite) incremental: bảng 'chunks' + virtual table 'chunks_fts'.
+- Demo Hybrid search: BM25 (FTS5) + Dense (Chroma) hợp nhất bằng RRF + trọng số.
+
+ENV:
+  OPENAI_API_KEY
+  CHROMA_DIR=./chroma_pccc_text_embedding_3_small
+  CHROMA_COLLECTION=pccc_vi_text_embedding_3_small
+  EMBED_MODEL=text-embedding-3-small
+
+  # Ingest
+  PCCC_CHUNKS=./pccc_chunks.jsonl
+  BATCH_EMBED=96
+  MAX_EMBED_TOTAL_TOKENS=280000
+  MAX_EMBED_TOKENS=8000
+  PRINT_EVERY=1000
+  PCCC_SCHEMA_VERSION=pccc_chunks/v1.2
+
+  # Modality split (tuỳ chọn)
+  SPLIT_BY_MODALITY=0
+
+  # FTS (lexical index)
+  BUILD_LEXICAL=1
+  FTS_DB=<mặc định: {CHROMA_DIR}/lexical/{COLLECTION}_fts.sqlite>
+
+  # Hybrid demo
+  HYBRID_TOPK_LEX=50
+  HYBRID_TOPK_VEC=30
+  HYBRID_FINAL_K=12
+  HYBRID_RRF_K=60
+  W_LEX=0.45
+  W_VEC=0.55
 """
 
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Any
-import argparse, json, os, sys, hashlib, time, math, random
+import argparse, json, os, sys, hashlib, time, math, random, sqlite3
 
 import chromadb
 import openai as openai_root
-from openai import OpenAI, BadRequestError  # dùng BadRequestError riêng
-import math 
-# Các lỗi còn lại lấy từ module openai_root để tương thích nhiều phiên bản
+from openai import OpenAI, BadRequestError
 
 # -----------------------------
 # Cấu hình & biến môi trường
@@ -30,15 +58,29 @@ import math
 
 PERSIST_DIR = Path(os.getenv("CHROMA_DIR", "./chroma_pccc_text_embedding_3_small"))
 COLLECTION  = os.getenv("CHROMA_COLLECTION", "pccc_vi_text_embedding_3_small")
-SPLIT_BY_MODALITY = os.getenv("SPLIT_BY_MODALITY", "0") == "1"
 JSONL_CHUNKS = Path(os.getenv("PCCC_CHUNKS", "./pccc_chunks.jsonl"))
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
 BATCH_EMBED = int(os.getenv("BATCH_EMBED", "96"))
-MAX_EMBED_TOTAL_TOKENS = int(os.getenv("MAX_EMBED_TOTAL_TOKENS", "280000"))  # an toàn < ~300k community-observed
-MAX_EMBED_TOKENS = int(os.getenv("MAX_EMBED_TOKENS", "8000"))  # an toàn ~8k/input
+MAX_EMBED_TOTAL_TOKENS = int(os.getenv("MAX_EMBED_TOTAL_TOKENS", "280000"))
+MAX_EMBED_TOKENS = int(os.getenv("MAX_EMBED_TOKENS", "8000"))
 PRINT_EVERY = int(os.getenv("PRINT_EVERY", "1000"))
-SCHEMA_VERSION = os.getenv("PCCC_SCHEMA_VERSION", "pccc_chunks/v1.1")
+SCHEMA_VERSION = os.getenv("PCCC_SCHEMA_VERSION", "pccc_chunks/v1.2")
+
+SPLIT_BY_MODALITY = os.getenv("SPLIT_BY_MODALITY", "0") == "1"
+
+# FTS (lexical)
+BUILD_LEXICAL = os.getenv("BUILD_LEXICAL", "1") == "1"
+_FTS_DEFAULT_DIR = PERSIST_DIR / "lexical"
+FTS_DB = os.getenv("FTS_DB", str(_FTS_DEFAULT_DIR / f"{COLLECTION}_fts.sqlite"))
+
+# Hybrid demo params
+HYBRID_TOPK_LEX = int(os.getenv("HYBRID_TOPK_LEX", "50"))
+HYBRID_TOPK_VEC = int(os.getenv("HYBRID_TOPK_VEC", "30"))
+HYBRID_FINAL_K  = int(os.getenv("HYBRID_FINAL_K", "12"))
+HYBRID_RRF_K    = int(os.getenv("HYBRID_RRF_K", "60"))
+W_LEX = float(os.getenv("W_LEX", "0.45"))
+W_VEC = float(os.getenv("W_VEC", "0.55"))
 
 VALID_INCLUDE = {"documents", "embeddings", "metadatas", "distances", "uris", "data"}
 
@@ -133,14 +175,12 @@ def _to_scalar(v: Any) -> Any:
     except Exception:
         return str(v)
 
-
 def sanitize_metadata(md: dict) -> dict:
     """
     Chuẩn hóa metadata để tương thích Chroma:
-    - Bỏ key có value None
-    - Bỏ float NaN/Inf
-    - Giữ nguyên str/int/float/bool
-    - Với list/dict/... -> json.dumps(...) (str)
+    - Bỏ None, NaN/Inf
+    - Giữ str/int/float/bool
+    - list/dict/... -> json.dumps(...)
     """
     if not md:
         return {"schema_version": SCHEMA_VERSION}
@@ -148,29 +188,19 @@ def sanitize_metadata(md: dict) -> dict:
     out = {}
     for k, v in md.items():
         key = str(k)
-
-        # 1) loại None
         if v is None:
             continue
-
-        # 2) số đặc biệt: NaN/Inf -> bỏ
         if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
             continue
-
-        # 3) các kiểu được phép
         if isinstance(v, (str, int, float, bool)):
             out[key] = v
             continue
-
-        # 4) mọi thứ khác -> stringify an toàn
         try:
             out[key] = json.dumps(v, ensure_ascii=False)
         except Exception:
             out[key] = str(v)
-
     out["schema_version"] = SCHEMA_VERSION
     return out
-
 
 def _starts_with(s: str, prefix: str) -> bool:
     return (s or "").lstrip().startswith(prefix)
@@ -189,7 +219,7 @@ def detect_modality(text: str, md: dict) -> str:
     return "text"
 
 # -----------------------------
-# Embedding: token-budget batching + retry/backoff
+# Embedding helpers (batch + retry/backoff)
 # -----------------------------
 
 def _call_embeddings(client: OpenAI, model: str, inputs: List[str]) -> List[List[float]]:
@@ -203,7 +233,6 @@ def _call_embeddings_with_split_on_error(client: OpenAI, model: str, inputs: Lis
         msg = (getattr(e, "message", None) or str(e) or "").lower()
         if ("max_tokens_per_request" in msg) or ("per request" in msg and "tokens" in msg):
             if len(inputs) == 1:
-                # input đơn vẫn quá to → để dev điều chỉnh MAX_EMBED_TOKENS
                 raise
             mid = len(inputs) // 2
             left  = _call_embeddings_with_split_on_error(client, model, inputs[:mid])
@@ -212,9 +241,6 @@ def _call_embeddings_with_split_on_error(client: OpenAI, model: str, inputs: Lis
         raise
 
 def _retryable_embed_batch(client: OpenAI, model: str, inputs: List[str], max_retries: int = 6) -> List[List[float]]:
-    """
-    Retry/backoff cho RateLimit/Timeout/5xx. Jitter để tránh thác yêu cầu.
-    """
     base = 1.2
     for attempt in range(max_retries):
         try:
@@ -227,7 +253,6 @@ def _retryable_embed_batch(client: OpenAI, model: str, inputs: List[str], max_re
             time.sleep(sleep)
             continue
         except openai_root.APIError as e:
-            # 5xx → retry; 4xx (khác BadRequest đã xử lý ở trên) → raise
             status = getattr(e, "status_code", None) or getattr(e, "status", None)
             if status and int(status) >= 500:
                 sleep = base ** attempt + random.uniform(0, 0.6)
@@ -252,7 +277,7 @@ def embed_texts_safe(client: OpenAI, texts: List[str], model: str) -> List[List[
             if total_tok + need > MAX_EMBED_TOTAL_TOKENS:
                 break
             total_tok += need; cnt += 1; j += 1
-        if j == i:  # không nhét nổi → gửi đơn lẻ
+        if j == i:
             j = i + 1
         sub_inputs = cut_texts[i:j]
         vecs = _retryable_embed_batch(client, model, sub_inputs)
@@ -261,7 +286,126 @@ def embed_texts_safe(client: OpenAI, texts: List[str], model: str) -> List[List[
     return out
 
 # -----------------------------
-# Ingest incremental (+ modality split optional, reuse vectors)
+# FTS (SQLite) — lexical index
+# -----------------------------
+
+def _fts_connect() -> sqlite3.Connection:
+    Path(FTS_DB).parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(FTS_DB)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    con.execute("PRAGMA temp_store=MEMORY;")
+    return con
+
+def _fts_init_schema(con: sqlite3.Connection):
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS chunks (
+        id TEXT PRIMARY KEY,
+        text TEXT NOT NULL,
+        doc_id TEXT,
+        source_sha1 TEXT,
+        modality TEXT,
+        van_ban TEXT,
+        dieu TEXT,
+        khoan TEXT,
+        diem TEXT,
+        parent_id TEXT,
+        ancestor_dieu_id TEXT
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
+        USING fts5(text, content='chunks', content_rowid='rowid', tokenize='unicode61');
+    CREATE INDEX IF NOT EXISTS idx_chunks_sha1 ON chunks(source_sha1);
+    CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_id);
+    CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+        INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.text);
+    END;
+    CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+    END;
+    CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+        INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.text);
+    END;
+    """)
+    con.commit()
+
+def fts_upsert_rows(rows: List[dict]):
+    """rows: mỗi item gồm {id,text,doc_id,source_sha1,modality,van_ban,dieu,khoan,diem,parent_id,ancestor_dieu_id}"""
+    if not BUILD_LEXICAL or not rows:
+        return
+    con = _fts_connect()
+    try:
+        _fts_init_schema(con)
+        cur = con.cursor()
+        cur.execute("BEGIN;")
+        cur.executemany("""
+            INSERT INTO chunks(id,text,doc_id,source_sha1,modality,van_ban,dieu,khoan,diem,parent_id,ancestor_dieu_id)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                text=excluded.text,
+                doc_id=excluded.doc_id,
+                source_sha1=excluded.source_sha1,
+                modality=excluded.modality,
+                van_ban=excluded.van_ban,
+                dieu=excluded.dieu,
+                khoan=excluded.khoan,
+                diem=excluded.diem,
+                parent_id=excluded.parent_id,
+                ancestor_dieu_id=excluded.ancestor_dieu_id;
+        """, [
+            (
+                r.get("id"),
+                r.get("text") or "",
+                r.get("doc_id"),
+                r.get("source_sha1"),
+                r.get("modality"),
+                r.get("van_ban"),
+                r.get("dieu"),
+                r.get("khoan"),
+                r.get("diem"),
+                r.get("parent_id"),
+                r.get("ancestor_dieu_id"),
+            )
+            for r in rows
+        ])
+        con.commit()
+    finally:
+        con.close()
+
+def fts_search(query: str, topk: int) -> List[Tuple[str, float]]:
+    """
+    Trả về [(id, score_lex)], score_lex đã chuẩn hóa về miền cao-là-tốt.
+    FTS5 bm25() -> điểm thấp là tốt. Ta dùng: score = 1 / (1 + bm25)
+    """
+    if not BUILD_LEXICAL:
+        return []
+    con = _fts_connect()
+    try:
+        _fts_init_schema(con)
+        cur = con.cursor()
+        # match: dùng FTS5 unicode61; câu hỏi có dấu → ok.
+        cur.execute(f"""
+            SELECT c.id, bm25(chunks_fts) AS rank
+            FROM chunks_fts
+            JOIN chunks c ON c.rowid = chunks_fts.rowid
+            WHERE chunks_fts MATCH ?
+            ORDER BY rank ASC
+            LIMIT ?;
+        """, (query, int(topk)))
+        rows = cur.fetchall()
+        out = []
+        for cid, bm in rows:
+            try:
+                bm = float(bm)
+            except Exception:
+                bm = 100.0
+            out.append((cid, 1.0/(1.0 + bm)))
+        return out
+    finally:
+        con.close()
+
+# -----------------------------
+# Ingest incremental (+ modality split, + FTS upsert)
 # -----------------------------
 
 def _validate_row(r: dict) -> Optional[str]:
@@ -301,6 +445,14 @@ def ingest_chunks_to_chroma(
     n_upserted = 0
     emb_dim: Optional[int] = None
 
+    # chuẩn bị FTS schema sớm (nếu bật)
+    if BUILD_LEXICAL:
+        con = _fts_connect()
+        try:
+            _fts_init_schema(con)
+        finally:
+            con.close()
+
     for idx, sha1 in enumerate(sha1_list, 1):
         if present_map.get(sha1):
             print(f"[SKIP] Source đã tồn tại (SHA1={sha1[:12]}...)")
@@ -324,6 +476,9 @@ def ingest_chunks_to_chroma(
         ids_table: List[str] = []; docs_table: List[str] = []; metas_table: List[dict] = []; vecs_table: List[List[float]] = []
         ids_image: List[str] = []; docs_image: List[str] = []; metas_image: List[dict] = []; vecs_image: List[List[float]] = []
 
+        # thu thập dữ liệu cho FTS
+        fts_rows: List[dict] = []
+
         for r in rows:
             cid = r.get("chunk_id") or hashlib.sha1((sha1 + "|" + (r.get("text") or "")).encode("utf-8")).hexdigest()[:16]
             text = r.get("text") or ""
@@ -333,7 +488,27 @@ def ingest_chunks_to_chroma(
             if r.get("doc_id"): md["doc_id"] = r["doc_id"]
             modality = detect_modality(text, md_raw)
             md["modality"] = modality
+
             ids.append(str(cid)); docs.append(text); metas.append(md); modalities.append(modality)
+
+            if BUILD_LEXICAL:
+                fts_rows.append({
+                    "id": str(cid),
+                    "text": text,
+                    "doc_id": r.get("doc_id"),
+                    "source_sha1": sha1,
+                    "modality": modality,
+                    "van_ban": md_raw.get("van_ban") or md.get("van_ban"),
+                    "dieu": (md_raw.get("dieu") or md.get("dieu")),
+                    "khoan": (md_raw.get("khoan") or md.get("khoan")),
+                    "diem": (md_raw.get("diem") or md.get("diem")),
+                    "parent_id": (md_raw.get("parent_id") or md.get("parent_id")),
+                    "ancestor_dieu_id": (md_raw.get("ancestor_dieu_id") or md.get("ancestor_dieu_id")),
+                })
+
+        # Upsert vào FTS trước (để demo hybrid có thể chạy ngay cả khi embedding đợi)
+        if BUILD_LEXICAL and fts_rows:
+            fts_upsert_rows(fts_rows)
 
         # Embed + upsert theo batch
         for i in range(0, len(ids), BATCH_EMBED):
@@ -352,7 +527,8 @@ def ingest_chunks_to_chroma(
                     elif _mod == "image":
                         ids_image.append(sub_ids[k]); docs_image.append(sub_docs[k]); metas_image.append(sub_metas[k]); vecs_image.append(vecs[k])
 
-        if SPLIT_BY_MODALITY and tables_col and ids_table:
+        if SPLIT_BY_MODALITY and ids_table:
+            tables_col = get_or_create_collection(client_chroma, f"{collection_name}_tables")
             for i in range(0, len(ids_table), 2048):
                 tables_col.upsert(
                     ids=ids_table[i:i+2048],
@@ -360,7 +536,8 @@ def ingest_chunks_to_chroma(
                     documents=docs_table[i:i+2048],
                     metadatas=metas_table[i:i+2048],
                 )
-        if SPLIT_BY_MODALITY and images_col and ids_image:
+        if SPLIT_BY_MODALITY and ids_image:
+            images_col = get_or_create_collection(client_chroma, f"{collection_name}_images")
             for i in range(0, len(ids_image), 2048):
                 images_col.upsert(
                     ids=ids_image[i:i+2048],
@@ -377,90 +554,151 @@ def ingest_chunks_to_chroma(
           + (f" | dim={emb_dim}" if emb_dim else ""))
     if SPLIT_BY_MODALITY:
         print(f"   (Đã tạo/bổ sung collection phụ: '{collection_name}_tables' và '{collection_name}_images')")
+    if BUILD_LEXICAL:
+        print(f"   (Đã xây FTS lexical tại: {FTS_DB})")
 
     return (n_sources_total, n_sources_new, n_upserted, emb_dim)
 
 # -----------------------------
-# Retrieve (demo) — ưu tiên bảng/hình
+# Retrieve utils (dense + get by ids)
 # -----------------------------
 
-VALID_INCLUDE = {"documents", "metadatas", "distances"}
+_VALID_INCLUDE = {"documents", "metadatas", "distances"}
 def _safe_include(items):
     if not items: return None
-    return [x for x in items if x in VALID_INCLUDE] or None
+    return [x for x in items if x in _VALID_INCLUDE] or None
 
 def embed_query(client: OpenAI, q: str, model: str) -> List[float]:
     q = truncate_tokens(q, MAX_EMBED_TOKENS)
     return client.embeddings.create(model=model, input=[q]).data[0].embedding
 
-def retrieve(
-    query: str,
-    collection_name: str,
-    top_k: int = 5,
-    prefer_modality: Optional[str] = None,   # None|"table"|"image"|"text"
-    only_modality: bool = False,
-) -> Dict[str, Any]:
+def _normalize_distance_to_similarity(distances: List[Optional[float]]) -> List[float]:
+    vals = [d for d in distances if d is not None]
+    if not vals:
+        return [0.0] * len(distances)
+    mn, mx = min(vals), max(vals)
+    if mx <= mn + 1e-12:
+        return [1.0] * len(distances)
+    return [1.0 - ((d - mn) / (mx - mn)) if d is not None else 0.0 for d in distances]
+
+def chroma_query_vec(query: str, collection_name: str, top_k: int) -> List[dict]:
     client_oai = get_openai_client()
     qvec = embed_query(client_oai, query, EMBED_MODEL)
     client_chroma = get_persistent_client()
-    collection = client_chroma.get_or_create_collection(name=collection_name)
-
-    where = None; where_document = None
-    if prefer_modality in {"table", "image", "text"}:
-        where = {"modality": {"$eq": prefer_modality}} if only_modality else {"$or": [{"modality": {"$eq": prefer_modality}}]}
-        if prefer_modality == "table":
-            where_document = {"$contains": "[BẢNG]"}  # full-text filter vào nội dung
-        elif prefer_modality == "image":
-            where_document = {"$contains": "[HÌNH]"}
-
-    include_fields = _safe_include(["documents", "metadatas", "distances"])
-    res = collection.query(
+    col = client_chroma.get_or_create_collection(name=collection_name)
+    res = col.query(
         query_embeddings=[qvec],
         n_results=top_k,
-        where=where,
-        where_document=where_document,
-        include=include_fields,
+        include=_safe_include(["documents","metadatas","distances"]),
     )
-
-    out = []
     ids_ = res.get("ids", [[]])[0]
     docs_ = res.get("documents", [[]])[0] if res.get("documents") else []
     metas_ = res.get("metadatas", [[]])[0] if res.get("metadatas") else []
     dists_ = res.get("distances", [[]])[0] if res.get("distances") else []
-
+    sims = _normalize_distance_to_similarity(dists_)
+    out = []
     for i in range(max(len(ids_), len(docs_), len(metas_), len(dists_))):
         m = metas_[i] if i < len(metas_) else {}
         out.append({
             "id": ids_[i] if i < len(ids_) else None,
+            "text": docs_[i] if i < len(docs_) else "",
+            "metadata": (m or {}),
+            "sim_vec": sims[i] if i < len(sims) else 0.0,
             "distance": dists_[i] if i < len(dists_) else None,
-            "text": docs_[i] if i < len(docs_) else None,
-            "citation": (m or {}).get("citation") or "",
-            "doc_id": (m or {}).get("doc_id") or "",
-            "van_ban": (m or {}).get("van_ban") or "",
-            "dieu": (m or {}).get("dieu"),
-            "khoan": (m or {}).get("khoan"),
-            "diem": (m or {}).get("diem"),
-            "page_start": (m or {}).get("page_start"),
-            "page_end": (m or {}).get("page_end"),
-            "source_sha1": (m or {}).get("source_sha1"),
-            "modality": (m or {}).get("modality"),
-            "has_table_html": (m or {}).get("has_table_html"),
-            "has_image": (m or {}).get("has_image"),
         })
-    return {"query": query, "top_k": top_k, "results": out}
+    return out
+
+def chroma_get_by_ids(collection_name: str, ids: List[str]) -> Dict[str, dict]:
+    if not ids:
+        return {}
+    client = get_persistent_client()
+    col = client.get_or_create_collection(name=collection_name)
+    res = col.get(ids=ids, include=_safe_include(["documents","metadatas"]))
+    out = {}
+    for i, cid in enumerate(res.get("ids", [])):
+        out[cid] = {
+            "id": cid,
+            "text": (res.get("documents") or [""])[i],
+            "metadata": (res.get("metadatas") or [{}])[i],
+        }
+    return out
+
+# -----------------------------
+# Hybrid search (demo): FTS (BM25) + Dense (Chroma) + RRF
+# -----------------------------
+
+def _rrf_scores(ids: List[str], base: int = HYBRID_RRF_K) -> Dict[str, float]:
+    return {cid: 1.0 / (base + rank) for rank, cid in enumerate(ids, start=1)}
+
+def hybrid_retrieve(
+    query: str,
+    collection_name: str,
+    topk_lex: int = HYBRID_TOPK_LEX,
+    topk_vec: int = HYBRID_TOPK_VEC,
+    final_k: int = HYBRID_FINAL_K,
+) -> List[dict]:
+    # 1) Lexical (FTS5)
+    lex_hits = fts_search(query, topk_lex)  # [(id, score_lex)]
+    lex_ids = [cid for cid, _ in lex_hits]
+    # Lấy nội dung/metadata cho lexical ids từ Chroma (để thống nhất output)
+    lex_docs = chroma_get_by_ids(collection_name, lex_ids)
+    # Bổ sung điểm RRF cho lexical
+    rrf_lex = _rrf_scores(lex_ids, base=HYBRID_RRF_K)
+    lex_pack = []
+    for cid, s_lex in lex_hits:
+        obj = lex_docs.get(cid, {"id": cid, "text": "", "metadata": {}})
+        obj["score_lex"] = float(s_lex)
+        obj["rrf_lex"] = rrf_lex.get(cid, 0.0)
+        lex_pack.append(obj)
+
+    # 2) Dense (Chroma)
+    vec_hits = chroma_query_vec(query, collection_name, topk_vec)  # [{"id","text","metadata","sim_vec"}]
+    vec_ids = [h["id"] for h in vec_hits if h.get("id")]
+    rrf_vec = _rrf_scores(vec_ids, base=HYBRID_RRF_K)
+    for h in vec_hits:
+        h["score_vec"] = float(h.get("sim_vec", 0.0))
+        h["rrf_vec"] = rrf_vec.get(h["id"], 0.0)
+
+    # 3) Hợp nhất theo id
+    pool: Dict[str, dict] = {}
+    for r in lex_pack:
+        cid = r["id"]; pool[cid] = r
+    for r in vec_hits:
+        cid = r["id"]
+        if cid in pool:
+            # gộp điểm & giữ text/metadata từ vec (đủ hơn)
+            pool[cid]["text"] = r.get("text") or pool[cid].get("text") or ""
+            pool[cid]["metadata"] = r.get("metadata") or pool[cid].get("metadata") or {}
+            pool[cid]["score_vec"] = r.get("score_vec", 0.0)
+            pool[cid]["rrf_vec"]   = r.get("rrf_vec", 0.0)
+        else:
+            pool[cid] = r
+
+    # 4) Tính fused score
+    out = []
+    for cid, it in pool.items():
+        s_lex = float(it.get("score_lex", 0.0))
+        s_vec = float(it.get("score_vec", 0.0))
+        rrf = float(it.get("rrf_lex", 0.0)) + float(it.get("rrf_vec", 0.0))
+        fused = W_LEX*s_lex + W_VEC*s_vec + rrf
+        it["score_hybrid"] = fused
+        out.append(it)
+
+    out.sort(key=lambda x: x.get("score_hybrid", 0.0), reverse=True)
+    return out[:final_k]
 
 # -----------------------------
 # CLI
 # -----------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Index incremental chunks vào Chroma (ưu tiên bảng/hình)")
+    p = argparse.ArgumentParser(description="Index chunks vào Chroma + xây FTS (lexical) + demo Hybrid search")
     p.add_argument("--chunks", type=str, default=str(JSONL_CHUNKS), help="Đường dẫn pccc_chunks.jsonl")
     p.add_argument("--collection", type=str, default=COLLECTION, help="Tên collection Chroma")
     p.add_argument("--demo_query", type=str, default=os.getenv("DEMO_QUERY", ""), help="Truy vấn demo sau khi ingest")
-    p.add_argument("--top_k", type=int, default=5)
-    p.add_argument("--prefer_modality", type=str, choices=["table","image","text"], default=None)
-    p.add_argument("--only_modality", action="store_true")
+    p.add_argument("--topk_lex", type=int, default=HYBRID_TOPK_LEX)
+    p.add_argument("--topk_vec", type=int, default=HYBRID_TOPK_VEC)
+    p.add_argument("--final_k", type=int, default=HYBRID_FINAL_K)
     return p.parse_args()
 
 def main():
@@ -474,21 +712,26 @@ def main():
     )
 
     if args.demo_query.strip():
-        print("\n=== DEMO RESULTS ===")
-        res = retrieve(args.demo_query, args.collection, top_k=args.top_k,
-                       prefer_modality=args.prefer_modality, only_modality=args.only_modality)
-        for r in res["results"]:
-            label_parts = []
-            if r.get("van_ban"): label_parts.append(r["van_ban"])
+        print("\n=== HYBRID DEMO RESULTS (BM25 + Dense + RRF) ===")
+        results = hybrid_retrieve(
+            query=args.demo_query.strip(),
+            collection_name=args.collection,
+            topk_lex=args.topk_lex,
+            topk_vec=args.topk_vec,
+            final_k=args.final_k,
+        )
+        for i, r in enumerate(results, 1):
+            md = r.get("metadata") or {}
             segs = []
-            if r.get("dieu"): segs.append(f"Điều {r['dieu']}")
-            if r.get("khoan"): segs.append(f"Khoản {r['khoan']}")
-            if r.get("diem"): segs.append(f"Điểm {r['diem']}")
-            label = " — ".join([label_parts[0], ", ".join(segs)]) if (label_parts and segs) else (label_parts[0] if label_parts else ", ".join(segs))
-            dist = r.get("distance"); mod = r.get("modality") or "text"
-            print(f"- [{mod.upper()}] {label or 'Văn bản'} | dist={dist:.4f}" if dist is not None else f"- [{mod.UPPER()}] {label or 'Văn bản'}")
+            if md.get("van_ban"): segs.append(md["van_ban"])
+            parts = []
+            if md.get("dieu"):  parts.append(f"Điều {md['dieu']}")
+            if md.get("khoan"): parts.append(f"Khoản {md['khoan']}")
+            if md.get("diem"):  parts.append(f"Điểm {md['diem']}")
+            label = (segs[0] + (" — " + ", ".join(parts) if parts else "")) if segs else ", ".join(parts)
+            print(f"{i:>2}. {label or 'Văn bản'} | hybrid={r.get('score_hybrid',0):.4f} (lex={r.get('score_lex',0):.3f}, vec={r.get('score_vec',0):.3f})")
             txt = (r.get("text") or "").strip().replace("\n", " ")
-            print("  →", (txt[:240] + ("..." if len(txt) > 240 else "")))
+            print("    →", (txt[:240] + ("..." if len(txt) > 240 else "")))
         print()
 
 if __name__ == "__main__":

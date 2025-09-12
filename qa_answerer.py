@@ -2,23 +2,34 @@
 # -*- coding: utf-8 -*-
 
 """
-QA Answerer PCCC (VN) — retrieve → (lọc/ưu tiên modality) → rerank → generate
-- Nếu câu hỏi về BẢNG: in nguyên văn bảng Markdown trước, rồi giải thích & trích dẫn.
-- Ưu tiên văn bản mới (recency) nếu metadata có ngày; giảm trùng.
+QA Answerer PCCC (VN) — HYBRID RETRIEVAL: lexical (BM25) + dense (emb) → RRF → parent-scope expand → reranker → answer
+- Nếu câu hỏi về BẢNG: in bảng Markdown trước, rồi giải thích & trích dẫn.
+- Ưu tiên văn bản mới; giảm trùng; chống lẫn Khoản/Điểm giữa các Điều bằng Parent-Document expansion + scope prior.
 - Agent chuẩn hoá prompt & chống lệch chủ đề (prompt_guard).
 
-ENV:
+ENV chính:
   OPENAI_API_KEY
   CHROMA_DIR=./chroma_pccc_text_embedding_3_small
   CHROMA_COLLECTION=pccc_vi_text_embedding_3_small
-
   EMBED_MODEL=text-embedding-3-small
   CHAT_MODEL=gpt-4o-mini
 
-  TOPK_RETRIEVE=20
-  PREFER_MODALITY=auto       # auto|table|image|text|none
-  ONLY_MODALITY=0            # 1 = lọc chặt theo modality bằng where_document [BẢNG]/[HÌNH]
-  STRICT_TABLE_RETRIEVE=0    # 1 = nếu query là 'table' thì ép only_modality=True
+  # Hybrid search
+  HYBRID_SEARCH=1
+  LEXICAL_JSONL=./pccc_chunks.jsonl
+  TOPK_LEXICAL=50
+  TOPK_DENSE=20
+  RRF_K=60
+
+  # Parent expansion
+  PARENT_EXPAND=1
+  PARENT_TOP_GROUPS=3
+  PARENT_LIMIT_PER_GROUP=12
+
+  # Retrieve options
+  PREFER_MODALITY=auto
+  ONLY_MODALITY=0
+  STRICT_TABLE_RETRIEVE=0
 
   # Rerank
   RERANK_BACKEND=cross_encoder
@@ -26,9 +37,9 @@ ENV:
   RERANK_MAX_LEN=512
   TOPK_RERANK=30
   FINAL_K=8
-
-  # Trọng số rerank (w_ce,w_vec,w_mod,w_rec,w_coh)
   W_CE=0.64 W_VEC=0.18 W_MOD=0.08 W_REC=0.07 W_COH=0.03
+  # Priors mở rộng (lexical/scope/money)
+  W_LEX=0.06 W_SCOPE=0.06 W_MONEY=0.04
 
   # Render bảng
   TABLE_RENDER_MAX_ROWS=30
@@ -43,13 +54,13 @@ ENV:
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
-import os, re, json, argparse
+import os, re, json, argparse, unicodedata, threading
 
 import chromadb
 from openai import OpenAI
 from prompt_guard import guard_prompt
 
-# ---------- Embedding tokenizer ----------
+# ================== Embedding tokenizer ==================
 try:
     import tiktoken
     ENC = tiktoken.get_encoding("cl100k_base")
@@ -66,7 +77,7 @@ def truncate_tokens(s: str, max_tokens: int) -> str:
     ids = ENC.encode(s or "")
     return ENC.decode(ids[:max_tokens])
 
-# ---------- OpenAI ----------
+# ================== OpenAI ==================
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL  = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 
@@ -79,7 +90,7 @@ def embed_query(client: OpenAI, q: str) -> List[float]:
     q = truncate_tokens(q, int(os.getenv("MAX_EMBED_TOKENS", "8000")))
     return client.embeddings.create(model=EMBED_MODEL, input=[q]).data[0].embedding
 
-# ---------- Chroma ----------
+# ================== Chroma ==================
 PERSIST_DIR   = Path(os.getenv("CHROMA_DIR", "./chroma_pccc_text_embedding_3_small"))
 COLLECTION    = os.getenv("CHROMA_COLLECTION", "pccc_vi_text_embedding_3_small")
 VALID_INCLUDE = {"documents","metadatas","distances","embeddings","uris","data"}
@@ -91,7 +102,7 @@ def get_chroma_collection(name: str):
 def _safe_include(items: List[str]):
     return [x for x in items if x in VALID_INCLUDE] or None
 
-# ---------- Heuristics modality ----------
+# ================== Heuristics modality ==================
 _TABLE_PAT = re.compile(r"\b(bảng|bang|table|biểu|biểu)\b", re.I | re.U)
 _IMAGE_PAT = re.compile(r"\b(hình|hinh|ảnh|anh|figure|sơ đồ|so do|biểu đồ|biểu đồ)\b", re.I | re.U)
 
@@ -106,15 +117,14 @@ def _infer_modality_from_text(txt: str) -> str:
     if t.startswith("[HÌNH]"): return "image"
     return "text"
 
-# ---------- Retrieve (dùng where_document để lọc theo nội dung văn bản) ----------
-# Tài liệu: Chroma hỗ trợ where_document với toán tử $contains để lọc trên nội dung document. :contentReference[oaicite:3]{index=3}
-def retrieve(
+# ================== DENSE retrieve (Chroma) ==================
+def retrieve_dense(
     query: str,
     collection_name: str,
     top_k: int = 20,
     prefer_modality: Optional[str] = None,   # None|"table"|"image"|"text"
     only_modality: bool = False,
-) -> Dict[str, Any]:
+) -> List[Dict[str,Any]]:
     col = get_chroma_collection(collection_name)
     oai = get_openai_client()
     qvec = embed_query(oai, query)
@@ -126,7 +136,7 @@ def retrieve(
             where_document = {"$contains": "[BẢNG]"}
         elif prefer_modality == "image":
             where_document = {"$contains": "[HÌNH]"}
-    # prefer_modality="text" thì không lọc cứng; để rerank xử lý.
+    # prefer_modality="text" → không lọc cứng, để rerank xử lý.
 
     res = col.query(
         query_embeddings=[qvec],
@@ -136,7 +146,7 @@ def retrieve(
         include=_safe_include(["documents","metadatas","distances"]),
     )
 
-    out = []
+    out: List[Dict[str,Any]] = []
     ids_ = res.get("ids", [[]])[0]
     docs_ = res.get("documents", [[]])[0] if res.get("documents") else []
     metas_ = res.get("metadatas", [[]])[0] if res.get("metadatas") else []
@@ -146,7 +156,7 @@ def retrieve(
         doc_text = docs_[i] if i < len(docs_) else ""
         m = metas_[i] if i < len(metas_) else {}
         modality = (m or {}).get("modality") or _infer_modality_from_text(doc_text)
-        item = {
+        out.append({
             "id": ids_[i] if i < len(ids_) else None,
             "distance": dists_[i] if i < len(dists_) else None,
             "text": doc_text,
@@ -167,14 +177,283 @@ def retrieve(
             "effective_date": (m or {}).get("effective_date") or (m or {}).get("ngay_hieu_luc"),
             "ban_hanh_date": (m or {}).get("ban_hanh_date") or (m or {}).get("ngay_ban_hanh"),
             "updated_at": (m or {}).get("updated_at"),
-        }
-        out.append(item)
-    return {"query": query, "top_k": top_k, "results": out}
+            # parent scope (nếu đã index)
+            "ancestor_dieu_id": (m or {}).get("ancestor_dieu_id"),
+        })
+    return out
 
-# ---------- Reranking ----------
+# ================== LEXICAL retrieve (BM25 over JSONL) ==================
+try:
+    from rank_bm25 import BM25Okapi
+except Exception:
+    BM25Okapi = None  # fallback dense-only
+
+_WORD_RE = re.compile(r"[0-9A-Za-zÀ-ỹ]+", re.UNICODE)
+
+def _strip_accents(s: str) -> str:
+    if not s: return ""
+    import unicodedata as _ud
+    s = _ud.normalize("NFD", s)
+    s = "".join(ch for ch in s if _ud.category(ch) != "Mn")
+    return _ud.normalize("NFKC", s)
+
+def _tokenize_vi(s: str) -> List[str]:
+    s = _strip_accents((s or "").lower())
+    return _WORD_RE.findall(s)
+
+class _LexicalIndex:
+    def __init__(self, jsonl_path: Path):
+        self.path = jsonl_path
+        self.mtime = 0.0
+        self.docs: List[str] = []
+        self.tokens: List[List[str]] = []
+        self.meta: List[Dict[str,Any]] = []
+        self.bm25: Optional[BM25Okapi] = None
+        self._ensure_loaded(force=True)
+
+    def _ensure_loaded(self, force: bool = False):
+        if not self.path.exists():
+            return
+        mt = self.path.stat().st_mtime
+        if (not force) and mt <= self.mtime:
+            return
+        docs, toks, meta = [], [], []
+        with self.path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                txt = (obj.get("text") or "").strip()
+                if not txt: continue
+                md  = obj.get("metadata") or {}
+                doc_id = obj.get("doc_id") or md.get("doc_id") or ""
+                cid = obj.get("chunk_id") or obj.get("id") or md.get("id") or None
+                modality = (md.get("modality") or ("table" if txt.lstrip().startswith("[BẢNG]") else ("image" if txt.lstrip().startswith("[HÌNH]") else "text")))
+                record = {
+                    "id": cid,
+                    "distance": None,
+                    "text": txt,
+                    "citation": md.get("citation") or "",
+                    "doc_id": doc_id,
+                    "van_ban": md.get("van_ban"),
+                    "dieu": md.get("dieu"),
+                    "khoan": md.get("khoan"),
+                    "diem": md.get("diem"),
+                    "page_start": md.get("page_start"),
+                    "page_end": md.get("page_end"),
+                    "source_sha1": obj.get("source_sha1") or md.get("source_sha1"),
+                    "modality": modality,
+                    "has_table_html": md.get("has_table_html"),
+                    "table_html_excerpt": md.get("table_html_excerpt"),
+                    "has_image": md.get("has_image"),
+                    "effective_date": md.get("effective_date") or md.get("ngay_hieu_luc"),
+                    "ban_hanh_date": md.get("ban_hanh_date") or md.get("ngay_ban_hanh"),
+                    "updated_at": md.get("updated_at"),
+                    "ancestor_dieu_id": md.get("ancestor_dieu_id"),
+                }
+                docs.append(txt); toks.append(_tokenize_vi(txt)); meta.append(record)
+        if BM25Okapi is None:
+            self.bm25 = None
+        else:
+            self.bm25 = BM25Okapi(toks) if toks else None
+        self.docs, self.tokens, self.meta = docs, toks, meta
+        self.mtime = mt
+
+    def search(self, query: str, top_k: int = 50,
+               prefer_modality: Optional[str] = None,
+               only_modality: bool = False) -> List[Dict[str,Any]]:
+        self._ensure_loaded()
+        if not self.docs:
+            return []
+        q_tokens = _tokenize_vi(query)
+        scores = self.bm25.get_scores(q_tokens) if self.bm25 is not None else [0.0]*len(self.docs)
+        idxs = list(range(len(self.docs)))
+        idxs.sort(key=lambda i: scores[i], reverse=True)
+        results: List[Dict[str,Any]] = []
+        for i in idxs[:top_k]:
+            item = dict(self.meta[i])
+            item["bm25"] = float(scores[i])
+            results.append(item)
+        if prefer_modality in {"table","image"} and only_modality:
+            tag = "table" if prefer_modality == "table" else "image"
+            results = [r for r in results if (r.get("modality") == tag)]
+        return results
+
+_LEX_IDX: Optional[_LexicalIndex] = None
+def get_lexical_index() -> Optional[_LexicalIndex]:
+    global _LEX_IDX
+    path = Path(os.getenv("LEXICAL_JSONL", "./pccc_chunks.jsonl"))
+    if _LEX_IDX is None or (_LEX_IDX.path != path):
+        _LEX_IDX = _LexicalIndex(path)
+    return _LEX_IDX
+
+def retrieve_lexical(query: str, top_k: int, prefer_modality: Optional[str], only_modality: bool) -> List[Dict[str,Any]]:
+    idx = get_lexical_index()
+    if idx is None or not (idx.docs and idx.meta):
+        return []
+    return idx.search(query, top_k=top_k, prefer_modality=prefer_modality, only_modality=only_modality)
+
+# ================== RRF fusion (hybrid) ==================
+def rrf_fuse(dense: List[Dict[str,Any]], lexical: List[Dict[str,Any]], k: int = 60, limit: int = 50) -> List[Dict[str,Any]]:
+    def _key(c: Dict[str,Any]) -> str:
+        cid = c.get("id")
+        if cid: return str(cid)
+        sha = c.get("source_sha1") or ""
+        tx  = (c.get("text") or "")[:64]
+        return f"{sha}|{hash(tx)}"
+
+    r_dense  = { _key(c): r+1 for r, c in enumerate(dense) }
+    r_lex    = { _key(c): r+1 for r, c in enumerate(lexical) }
+    keys = set(r_dense) | set(r_lex)
+
+    fused: Dict[str, Dict[str,Any]] = {}
+    for key in keys:
+        base = next((c for c in dense if _key(c) == key), None) or next((c for c in lexical if _key(c) == key), None)
+        fused[key] = dict(base)
+        score = 0.0
+        if key in r_dense: score += 1.0 / (k + r_dense[key])
+        if key in r_lex:   score += 1.0 / (k + r_lex[key])
+        fused[key]["score_rrf"] = score
+        if key in r_lex:
+            fused[key]["bm25"] = fused[key].get("bm25", 0.0)
+
+    def _dense_sim(c: Dict[str,Any]) -> float:
+        d = c.get("distance")
+        return -float(d) if d is not None else 0.0
+
+    all_items = list(fused.values())
+    all_items.sort(key=lambda x: (x.get("score_rrf", 0.0),
+                                  (1 if (x.get("bm25") is not None and x.get("distance") is not None) else 0),
+                                  _dense_sim(x)), reverse=True)
+    return all_items[:limit]
+
+# ================== HYBRID retrieve orchestrator ==================
+def retrieve_hybrid(
+    query: str,
+    collection_name: str,
+    topk_dense: int,
+    topk_lex: int,
+    prefer_modality: Optional[str],
+    only_modality: bool,
+    final_limit: int,
+) -> List[Dict[str,Any]]:
+    dense_res: List[Dict[str,Any]] = []
+    lex_res:   List[Dict[str,Any]] = []
+
+    def _run_dense():
+        nonlocal dense_res
+        dense_res = retrieve_dense(query, collection_name, top_k=topk_dense, prefer_modality=prefer_modality, only_modality=only_modality)
+
+    def _run_lex():
+        nonlocal lex_res
+        lex_res = retrieve_lexical(query, top_k=topk_lex, prefer_modality=prefer_modality, only_modality=only_modality)
+
+    td = threading.Thread(target=_run_dense)
+    tl = threading.Thread(target=_run_lex)
+    td.start(); tl.start(); td.join(); tl.join()
+
+    k_rrf = int(os.getenv("RRF_K", "60"))
+    fused = rrf_fuse(dense_res, lex_res, k=k_rrf, limit=max(final_limit, max(topk_dense, topk_lex)))
+    return fused
+
+# ================== Parent-scope EXPANSION (Parent Document Retriever) ==================
+def _make_item_from_get(doc: str, md: dict, cid: str) -> Dict[str,Any]:
+    modality = (md or {}).get("modality")
+    if not modality:
+        modality = "table" if str(doc).lstrip().startswith("[BẢNG]") else ("image" if str(doc).lstrip().startswith("[HÌNH]") else "text")
+    return {
+        "id": cid,
+        "distance": None,
+        "text": doc or "",
+        "citation": (md or {}).get("citation") or "",
+        "doc_id": (md or {}).get("doc_id") or "",
+        "van_ban": (md or {}).get("van_ban") or "",
+        "dieu": (md or {}).get("dieu"),
+        "khoan": (md or {}).get("khoan"),
+        "diem": (md or {}).get("diem"),
+        "page_start": (md or {}).get("page_start"),
+        "page_end": (md or {}).get("page_end"),
+        "source_sha1": (md or {}).get("source_sha1"),
+        "modality": modality,
+        "has_table_html": (md or {}).get("has_table_html"),
+        "table_html_excerpt": (md or {}).get("table_html_excerpt"),
+        "has_image": (md or {}).get("has_image"),
+        "effective_date": (md or {}).get("effective_date") or (md or {}).get("ngay_hieu_luc"),
+        "ban_hanh_date": (md or {}).get("ban_hanh_date") or (md or {}).get("ngay_ban_hanh"),
+        "updated_at": (md or {}).get("updated_at"),
+        "ancestor_dieu_id": (md or {}).get("ancestor_dieu_id"),
+        "bm25": None,  # không có trong nhánh get()
+    }
+
+def expand_by_parent_scope(pool: List[Dict[str,Any]], collection_name: str,
+                           top_groups: int = 3, limit_per_group: int = 12, max_extra: int = 36) -> List[Dict[str,Any]]:
+    """
+    Lấy thêm các chunk cùng 'Điều' (ancestor_dieu_id hoặc dieu) trong cùng doc_id để giữ ngữ cảnh pháp lý nhất quán.
+    """
+    if not pool:
+        return pool
+    try:
+        col = get_chroma_collection(collection_name)
+    except Exception:
+        return pool
+
+    # Gom nhóm theo (doc_id, ancestor_dieu_id or dieu)
+    def gkey(c):
+        return (c.get("doc_id"), c.get("ancestor_dieu_id") or ("DIEU", c.get("dieu")))
+    groups: Dict[Tuple[str,Any], List[Dict[str,Any]]] = {}
+    for c in pool:
+        groups.setdefault(gkey(c), []).append(c)
+
+    # Chọn N nhóm mạnh nhất theo tổng score_rrf/bm25 (nếu có)
+    def gscore(items: List[Dict[str,Any]]) -> float:
+        s = 0.0
+        for it in items:
+            s += float(it.get("score_rrf") or 0.0) + float((it.get("bm25") or 0.0) * 1e-4)
+        return s
+
+    keys_sorted = sorted(groups.keys(), key=lambda k: gscore(groups[k]), reverse=True)[:max(1, top_groups)]
+
+    # Thu thập id đã có để tránh trùng
+    have_ids = set([str(c.get("id")) for c in pool if c.get("id")])
+
+    extra: List[Dict[str,Any]] = []
+    for k in keys_sorted:
+        doc_id, dieu_key = k
+        where = {"$and": [{"doc_id": {"$eq": doc_id}}]}
+        if isinstance(dieu_key, tuple) and dieu_key and dieu_key[0] == "DIEU":
+            # fallback theo 'dieu'
+            where["$and"].append({"dieu": {"$eq": dieu_key[1]}})
+        else:
+            where["$and"].append({"ancestor_dieu_id": {"$eq": dieu_key}})
+        try:
+            got = col.get(where=where, limit=limit_per_group, include=_safe_include(["documents", "metadatas"]))
+        except Exception:
+            continue
+        docs = (got or {}).get("documents") or []
+        mds  = (got or {}).get("metadatas") or []
+        ids  = (got or {}).get("ids") or []
+        for doc, md, cid in zip(docs, mds, ids):
+            cid_s = str(cid)
+            if cid_s in have_ids:
+                continue
+            item = _make_item_from_get(doc, md, cid_s)
+            extra.append(item)
+            have_ids.add(cid_s)
+            if len(extra) >= max_extra:
+                break
+        if len(extra) >= max_extra:
+            break
+
+    # Trộn: ưu tiên pool trước, rồi extra
+    return pool + extra
+
+# ================== Reranking (module riêng) ==================
 from rerankers import rerank_candidates, infer_query_modality as rr_infer_modality
 
-# ---------- Utilities: render bảng ----------
+# ================== Utilities: render bảng ==================
 _HTML_TAG = re.compile(r"<[^>]+>")
 
 def is_markdown_table(text: str) -> bool:
@@ -268,7 +547,7 @@ def pick_table_blocks_from_ranked(
         out.append((md, build_citation_label(item)))
     return out
 
-# ---------- Compose answer ----------
+# ================== Compose answer ==================
 REFUSAL = "Không đủ thông tin từ nguồn đã lập chỉ mục."
 
 def render_sources(ranked: List[Dict[str,Any]]) -> List[str]:
@@ -290,7 +569,7 @@ def make_system_prompt(is_table_query: bool) -> str:
         )
     return base
 
-def make_user_prompt(query: str, contexts: List[str], sources: List[str], table_blocks: List[Tuple[str,str]], is_table_query: bool) -> List[Dict[str,str]]:
+def make_user_prompt(query: str, contexts: List[str], sources: List[str], table_blocks: List[Tuple[str,str]], is_table_query: bool):
     ctx_blocks = []
     for i, (ctx, src) in enumerate(zip(contexts, sources), 1):
         ctx_blocks.append(f"[{i}] SOURCE: {src}\nEXCERPT:\n{ctx}")
@@ -331,9 +610,8 @@ def answer_with_llm(query: str, ranked: List[Dict[str,Any]]) -> Dict[str,Any]:
     max_chars = int(os.getenv("TABLE_RENDER_MAX_CHARS", "12000"))
     table_blocks = pick_table_blocks_from_ranked(ranked, max_tables=max_tabs, max_rows=max_rows, max_chars=max_chars) if is_table_query else []
 
-    msgs = make_user_prompt(query, contexts, sources, table_blocks, is_table_query)
-
     client = get_openai_client()
+    msgs = make_user_prompt(query, contexts, sources, table_blocks, is_table_query)
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=msgs,
@@ -343,7 +621,7 @@ def answer_with_llm(query: str, ranked: List[Dict[str,Any]]) -> Dict[str,Any]:
     ans = resp.choices[0].message.content.strip()
     return {"answer": ans, "sources": sources}
 
-# ---------- Public API ----------
+# ================== Public API ==================
 def answer_question(query: str, collection: str = COLLECTION, top_k_retrieve: Optional[int] = None,
                     prefer_modality: Optional[str] = None, only_modality: Optional[bool] = None) -> Dict[str,Any]:
     # 0) Prompt guard
@@ -365,8 +643,11 @@ def answer_question(query: str, collection: str = COLLECTION, top_k_retrieve: Op
             }
         query = g.get("normalized_query") or query
 
-    if top_k_retrieve is None:
-        top_k_retrieve = int(os.getenv("TOPK_RETRIEVE", "20"))
+    # Tham số
+    topk_dense = int(os.getenv("TOPK_DENSE", os.getenv("TOPK_RETRIEVE", "20")))
+    topk_lex   = int(os.getenv("TOPK_LEXICAL", "50"))
+    final_k    = int(os.getenv("FINAL_K", "8"))
+    hybrid_on  = (os.getenv("HYBRID_SEARCH", "1") == "1")
 
     # Tự động gợi ý modality
     if prefer_modality is None:
@@ -378,21 +659,41 @@ def answer_question(query: str, collection: str = COLLECTION, top_k_retrieve: Op
         else:
             prefer_modality = None
 
-    # STRICT_TABLE_RETRIEVE
+    # STRICT_TABLE_RETRIEVE / ONLY_MODALITY
     if only_modality is None:
         if (prefer_modality == "table") and (os.getenv("STRICT_TABLE_RETRIEVE","0") == "1"):
             only_modality = True
         else:
             only_modality = (os.getenv("ONLY_MODALITY","0") == "1")
 
-    # 1) Retrieve
-    ret = retrieve(query, collection, top_k=top_k_retrieve,
-                   prefer_modality=prefer_modality, only_modality=only_modality)
-    cands = ret["results"]
-    if not cands:
+    # 1) Retrieve (hybrid hoặc dense-only)
+    if hybrid_on and BM25Okapi is not None:
+        pool = retrieve_hybrid(
+            query=query,
+            collection_name=collection,
+            topk_dense=topk_dense,
+            topk_lex=topk_lex,
+            prefer_modality=prefer_modality,
+            only_modality=only_modality,
+            final_limit=max(final_k*3, max(topk_dense, topk_lex)),
+        )
+    else:
+        pool = retrieve_dense(query, collection, top_k=topk_dense, prefer_modality=prefer_modality, only_modality=only_modality)
+
+    if not pool:
         return {"answer": REFUSAL, "sources": []}
 
-    # 2) Re-rank
+    # 1b) Parent-scope expansion (giữ Điều nhất quán)
+    if os.getenv("PARENT_EXPAND", "1") == "1":
+        pool = expand_by_parent_scope(
+            pool,
+            collection_name=collection,
+            top_groups=int(os.getenv("PARENT_TOP_GROUPS","3")),
+            limit_per_group=int(os.getenv("PARENT_LIMIT_PER_GROUP","12")),
+            max_extra=int(os.getenv("PARENT_MAX_EXTRA","36")),
+        )
+
+    # 2) Re-rank (cross-encoder + priors)
     weights = (
         float(os.getenv("W_CE","0.64")),
         float(os.getenv("W_VEC","0.18")),
@@ -402,7 +703,7 @@ def answer_question(query: str, collection: str = COLLECTION, top_k_retrieve: Op
     )
     ranked = rerank_candidates(
         query=query,
-        candidates=cands,
+        candidates=pool,
         backend=os.getenv("RERANK_BACKEND","cross_encoder"),
         model_name=os.getenv("RERANK_MODEL","BAAI/bge-reranker-v2-m3"),
         max_length=int(os.getenv("RERANK_MAX_LEN","512")),
@@ -415,17 +716,19 @@ def answer_question(query: str, collection: str = COLLECTION, top_k_retrieve: Op
     # 3) Generate
     return answer_with_llm(query, ranked)
 
-# ---------- CLI ----------
+# ================== CLI ==================
 def main():
-    p = argparse.ArgumentParser(description="QA Answerer PCCC (retriever → reranker → answerer, in bảng nếu được hỏi)")
+    p = argparse.ArgumentParser(description="QA Answerer PCCC — HYBRID (BM25 + Dense) → RRF → Parent Expand → Rerank → Answer")
     p.add_argument("--query", type=str, default=os.getenv("DEMO_QUERY", ""), help="Câu hỏi để demo")
     p.add_argument("--collection", type=str, default=COLLECTION, help="Tên collection Chroma")
-    p.add_argument("--top_k", type=int, default=int(os.getenv("TOPK_RETRIEVE","20")))
     p.add_argument("--prefer_modality", type=str, default=None, choices=["table","image","text"], help="Ưu tiên modality")
     args = p.parse_args()
 
-    q = args.query.strip() or "Cách ăn "
-    res = answer_question(q, collection=args.collection, top_k_retrieve=args.top_k, prefer_modality=args.prefer_modality)
+    q = args.query.strip()
+    if not q:
+        q = "Không xuất trình hồ sơ về phòng cháy, chữa cháy phục vụ kiểm tra bị phạt bao nhiêu tiền?"
+        q = "Không cập nhật thông tin khi cơ sở có thay đổi so với thông tin đã khai báo trước đó vào hệ thống Cơ sở dữ liệu về phòng cháy bị phạt bao nhiêu"
+    res = answer_question(q, collection=args.collection, prefer_modality=args.prefer_modality)
     print("\n--- ANSWER ---\n", res.get("answer",""))
     if isinstance(res.get("sources"), list) and res["sources"]:
         print("\n--- SOURCES ---")
